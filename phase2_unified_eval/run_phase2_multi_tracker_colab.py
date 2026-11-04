@@ -931,7 +931,8 @@ def stage_repos_and_weights(
                     f"SIZE_MISMATCH_KEEP_AND_REFETCH: {dst.name} 现有 {dst.stat().st_size} != 期望 {exp}"
                 )
             try:
-                tk_res["weight_status"].append(_download_weight_file(drive_root, repo_drive, wf, dst))
+                src_repo = runtime_repo if (is_colab_runtime() and runtime_repo.exists()) else repo_drive
+                tk_res["weight_status"].append(_download_weight_file(drive_root, src_repo, wf, dst))
             except Exception as exc:
                 tk_res["weight_status"].append(f"WEIGHT_PULL_FAILED: {wf['role']} {dst.name}: {type(exc).__name__}: {exc}")
 
@@ -1771,7 +1772,10 @@ class UnifiedTrackerStepper:
             self.tracker = DAM4SAMTracker(DEFAULT_CFG)
 
         elif self.adapter == "sam2_samosa_samurai":
-            # 各 SAM2 改版仓库自带同名 sam2 包：把 <repo>/sam2 放在 sys.path 最前，确保导入的是本仓库版本
+            # 各 SAM2 改版仓库自带同名 sam2 包：把 <repo>/sam2 放在 sys.path 最前并移除父目录，杜绝命名空间包阴影
+            while str(REPO_DIR) in sys.path:
+                sys.path.remove(str(REPO_DIR))
+            os.chdir(REPO_DIR / "sam2")
             sys.path.insert(0, str(REPO_DIR / "sam2"))
             from sam2.build_sam import build_sam2_video_predictor
             self.build_predictor = build_sam2_video_predictor

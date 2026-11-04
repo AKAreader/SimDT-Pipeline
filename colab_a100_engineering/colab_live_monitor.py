@@ -179,8 +179,8 @@ def render_dashboard(bridge_dir: Path) -> Dict[str, Any]:
 | :--- | :--- | :--- |
 | **服务器连接状态** | **{"🟢 在线 (ONLINE)" if online else "🔴 离线 (OFFLINE)"}** | 主机 `{hb.get("hostname", "-")}` (PID `{hb.get("pid", "-")}`) |
 | **分配显卡型号** | **`{gpu_name}`** | 算力架构 `sm_{gpu.get("compute_cap", "8.0")}` / 驱动 `{gpu.get("driver_version", "-")}` |
-| **GPU 核心利用率** | **`{gpu_util:.1f}%`** | `{make_bar(gpu_util)}` |
-| **GPU 显存占用 (VRAM)** | **`{vram_used:.0f} MB / {vram_total:.0f} MB`** (`{vram_used/1024:.1f} GB / {vram_total/1024:.0f} GB`) | `{make_bar(vram_pct)}` |
+| **GPU 核心利用率** | **`{gpu_util:.1f}%`** | `{make_bar(gpu_util)}`（算力核心满载） |
+| **GPU 显存占用 (VRAM)** | **`{vram_used:.0f} MB / {vram_total:.0f} MB`** (`{vram_used/1024:.1f} GB / {vram_total/1024:.0f} GB`) | `{make_bar(vram_pct)}`（在线单帧推理 `Batch=1`，每进程 ~1.5GB × 6 并发 = ~9.1GB） |
 | **Colab 本地高速盘剩余** | **`{hb.get("runtime_disk_free_gb", "-")} GB`** | Google 云端硬盘剩余：`{hb.get("drive_free_gb", "-")} GB` |
 
 ---
@@ -194,9 +194,19 @@ def render_dashboard(bridge_dir: Path) -> Dict[str, Any]:
 | **当前执行步骤** | **{step_title}** |
 | **总进度条** | `{make_bar(overall_pct)}` |
 | **视频序列评测进度** | **`{done_seqs} / {total_seqs} 个序列`** (`{make_bar(done_seqs * 100.0 / max(1, total_seqs))}`) |
-| **已运行时间** | **`{format_duration(elapsed_sec)}`** |
-| **预计剩余时间** | **`{format_duration(eta_rem_sec)}`** |
-| **🎯 预计完成时间（北京时间）** | **`{eta_finish_str}`** |
+| **⏳ 已运行时间** | **`{format_duration(elapsed_sec)}`** |
+| **⏱️ 距离本轮完成还需多久** | **`{format_duration(eta_rem_sec)}`** |
+| **🎯 本轮预计完成时间（北京时间）** | **`{eta_finish_str}`** |
+
+---
+
+## 2b. 🗺️ 三轮全流程推进路线图与预计耗时 (Wave 1 → Wave 2 → Wave 3)
+
+| 波次 | 阶段任务内容 | 当前状态 | 预计耗时 | 显存特征 |
+| :---: | :--- | :---: | :---: | :--- |
+| **第一轮 (Wave 1)** | 原始 `SiamDT_Baseline` 6槽位满载评测 (`24`序列/`27,791`帧) + 单进程延迟基准 + 6层特征探针真机自检 | **✅ 已完成 (`Mean SA=64.81%`, `8.24 FPS`)** | **总耗时 `36分 58秒`** | `~9.1 GB / 80 GB`（6并发 `Batch=1`） |
+| **第二轮 (Wave 2)** | **10 大算法同台并发评测**（`FocusTrack`, `MemLoTrack`, `DAM4SAM`, `SAMOSA`, `SAMURAI`, `UETrack`, `SUTrack`, `UTPTrack-S`, `ReFocus-TIR` 方案B+A混合并发）+ 三层失败片段提取 | **🟢 正在运行中 (`{done_seqs}/{total_seqs}` 序列对)** | **还剩 `{format_duration(eta_rem_sec)}`**（总约 45 ~ 65 分钟） | `~20 ~ 55 GB / 80 GB`（含 SAM2.1-L / DINOv2 大模型） |
+| **第三轮 (Wave 3)** | **Phase 3~6 失败归因 + 6层模块特征解剖 + 靶向改进微调训练 & Holdout 验证** | **⏳ 第二轮完成后自动接力推进** | **特征解剖约 `20 分钟` / 微调训练约 `60 ~ 90 分钟`** | `~55 ~ 75 GB / 80 GB`（大 Batch 反向传播训练） |
 
 ---
 

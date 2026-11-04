@@ -1,0 +1,8 @@
+{
+  "cmd_id": "w2_start_v26",
+  "action": "run_wave1",
+  "args": ["--wave", "2"],
+  "params": {},
+  "timeout_sec": 43200,
+  "note": "Launch Wave 2: 10-tracker unified evaluation (hybrid_b_then_a, 6 A100 GPU slots) + 3-tier failure episode extraction"
+}

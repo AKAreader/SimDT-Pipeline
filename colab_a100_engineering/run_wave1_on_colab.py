@@ -232,4 +232,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if "--wave" in sys.argv and "2" in sys.argv:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import run_wave2_on_colab
+        run_wave2_on_colab.main()
+    else:
+        main()
