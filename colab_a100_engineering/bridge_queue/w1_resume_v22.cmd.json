@@ -1,0 +1,8 @@
+{
+  "cmd_id": "w1_resume_v22",
+  "action": "run_wave1",
+  "args": [],
+  "params": {},
+  "timeout_sec": 21600,
+  "note": "Resume Wave 1 after NVMe UV_CACHE_DIR fix (Step 1 fast-skipped)"
+}

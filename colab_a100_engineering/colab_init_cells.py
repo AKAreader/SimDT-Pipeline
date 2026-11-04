@@ -681,12 +681,13 @@ CELL_4_BASH_SCRIPT = r'''set -euo pipefail
 DRIVE_ROOT="${SIAMDT_DRIVE_ROOT:-/content/drive/MyDrive/SiamDT_Project}"
 SIAMDT_ENV="/content/envs/siamdt-cu118"
 MODERN_ENV="/content/envs/modern-pyt2"
-WHEEL_CACHE="$DRIVE_ROOT/environments/wheels"
 REQ_DIR="$DRIVE_ROOT/environments/requirements"
-mkdir -p "$WHEEL_CACHE/pip-cache" "$WHEEL_CACHE/uv-cache" "$REQ_DIR" /content/envs /content/uv-bootstrap
+mkdir -p "$REQ_DIR" /content/envs /content/uv-bootstrap /content/cache/pip /content/cache/uv
 
-export PIP_CACHE_DIR="$WHEEL_CACHE/pip-cache"
-export UV_CACHE_DIR="$WHEEL_CACHE/uv-cache"
+# 使用 Colab 本地 NVMe 缓存目录，避免 Google Drive FUSE 不支持 flock/hardlink 导致 uv 报 Operation not permitted (os error 1)
+export PIP_CACHE_DIR="/content/cache/pip"
+export UV_CACHE_DIR="/content/cache/uv"
+export UV_LINK_MODE="copy"
 export UV_PYTHON_INSTALL_DIR="/content/uv-python"
 
 T_START=$(date +%s)
@@ -700,18 +701,18 @@ UV="/content/uv-bootstrap/bin/uv"
 # 2. 创建并恢复 Tier-1 环境 (env_siamdt_cu118: Python 3.10.19 + Torch 2.0.0+cu118 + MMCV-full 1.7.2)
 if [ ! -x "$SIAMDT_ENV/bin/python" ]; then
     "$UV" python install 3.10.19
-    "$UV" venv --python 3.10.19 "$SIAMDT_ENV"
+    "$UV" venv --seed --python 3.10.19 "$SIAMDT_ENV"
 fi
 PY1="$SIAMDT_ENV/bin/python"
 
 # 幂等检查：若已通过全套导入门禁则直接跳过安装
 if ! "$PY1" -c "import torch, torchvision, mmcv, timm, shapely, visdom; from mmcv.ops import nms, roi_align; assert torch.__version__=='2.0.0+cu118' and mmcv.__version__=='1.7.2'" 2>/dev/null; then
-    echo "[Tier-1: env_siamdt_cu118] 正在利用 Drive 离线缓存恢复 SiamDT 专用环境 (首次缓存后重建仅需 ~45 秒)..."
-    "$UV" pip install --python "$PY1" pip==24.3.1 setuptools==68.2.2 wheel==0.41.3 cython==0.29.35 yapf==0.40.1
-    "$PY1" -m pip install torch==2.0.0+cu118 torchvision==0.15.1+cu118 --index-url https://download.pytorch.org/whl/cu118
+    echo "[Tier-1: env_siamdt_cu118] 正在构建恢复 SiamDT 专用环境..."
+    "$UV" pip install --python "$PY1" setuptools==68.2.2 wheel==0.41.3 cython==0.29.35 yapf==0.40.1
+    "$UV" pip install --python "$PY1" torch==2.0.0+cu118 torchvision==0.15.1+cu118 --index-url https://download.pytorch.org/whl/cu118
     "$PY1" -m pip install --no-deps --only-binary=:all: mmcv-full==1.7.2 \
         -f https://download.openmmlab.com/mmcv/dist/cu118/torch2.0.0/index.html
-    "$PY1" -m pip install numpy==1.24.4 scipy==1.10.1 matplotlib==3.7.5 opencv-python-headless==4.8.1.78 \
+    "$UV" pip install --python "$PY1" numpy==1.24.4 scipy==1.10.1 matplotlib==3.7.5 opencv-python-headless==4.8.1.78 \
         pillow==10.2.0 pycocotools==2.0.7 shapely==2.0.3 six==1.16.0 terminaltables==3.1.10 \
         timm==0.4.12 tqdm==4.66.2 visdom==0.2.4 addict==2.4.0
 fi
@@ -733,14 +734,14 @@ if [ -d "/content/runtime/Anti-UAV410/trackers/SiamDT/libs/swintransformer" ]; t
     "$PY1" setup.py develop --no-deps >/dev/null
 fi
 
-# 5. 创建并恢复 Tier-2 环境 (env_modern_pyt2: 复用 Colab 原生 PyTorch 2.x CUDA 12.x 站点包 + 现代对比算法依赖)
+# 5. 创建并恢复 Tier-2 环境 (env_modern_pyt2: 复用 Colab 原生 PyTorch 2.x + 现代对比算法依赖)
 if [ ! -x "$MODERN_ENV/bin/python" ]; then
-    python3 -m venv --system-site-packages "$MODERN_ENV"
+    "$UV" venv --system-site-packages --seed "$MODERN_ENV"
 fi
 PY2="$MODERN_ENV/bin/python"
 
 if ! "$PY2" -c "import torch, timm, einops, filterpy, huggingface_hub, safetensors" 2>/dev/null; then
-    echo "[Tier-2: env_modern_pyt2] 正在利用 Drive 缓存补齐 2025-2026 核心实验池 (FocusTrack/MemLoTrack/SAM2.1/UETrack) 依赖..."
+    echo "[Tier-2: env_modern_pyt2] 正在安装现代对比算法依赖..."
     "$UV" pip install --python "$PY2" timm einops filterpy huggingface_hub safetensors hydra-core iopath lmdb pandas pyyaml tqdm
 fi
 

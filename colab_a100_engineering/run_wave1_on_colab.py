@@ -104,14 +104,14 @@ def main() -> None:
             state["elapsed_sec"] = round(elapsed, 1)
 
             # 动态计算剩余时间 ETA
+            step_elapsed = max(1.0, now - float(state.get("_step_t0") or now))
             if idx == 1:
                 rem = max(30.0, total_est_sec - elapsed)
-                pct = min(10.0, round(elapsed / 60.0 * 10.0, 1))
+                pct = min(10.0, round(step_elapsed / 60.0 * 10.0, 1))
             elif idx == 2:
-                rem = max(60.0, (total_est_sec - 60.0) - (elapsed - state.get("_step_t0", now)))
-                pct = min(25.0, 10.0 + round((elapsed - state.get("_step_t0", now)) / 180.0 * 15.0, 1))
+                rem = max(60.0, (total_est_sec - 60.0) - step_elapsed)
+                pct = min(25.0, 10.0 + round(step_elapsed / 180.0 * 15.0, 1))
             elif idx == 3:
-                step_elapsed = max(1.0, now - state.get("_step_t0", now))
                 if done_seqs > 0:
                     sec_per_seq = step_elapsed / done_seqs
                     rem_seqs = max(0, total_seqs - done_seqs)
@@ -120,11 +120,9 @@ def main() -> None:
                     rem = max(120.0, 525.0 - step_elapsed)
                 pct = 25.0 + round(done_seqs / total_seqs * 60.0, 1)
             elif idx == 4:
-                step_elapsed = max(1.0, now - state.get("_step_t0", now))
                 rem = max(45.0, 105.0 - step_elapsed)
                 pct = 90.0
             else:
-                step_elapsed = max(1.0, now - state.get("_step_t0", now))
                 rem = max(10.0, 45.0 - step_elapsed)
                 pct = 96.0
 
@@ -164,8 +162,22 @@ def main() -> None:
         probe_script = str(PIPELINE_DIR / "phase5_feature_diagnosis/siamdt_6layer_feature_probe.py")
         tier1_py = "/content/envs/siamdt-cu118/bin/python"
 
-        # Step 1: Cells 1,2,3
-        _run_step(1, steps_plan[0][0], [sys.executable, init_script, "--run-cell", "1,2,3"])
+        # Step 1: Cells 1,2,3 (若已在本地 NVMe 解压完毕则秒级跳过)
+        ckpt_ready = Path("/content/runtime/Anti-UAV410/trackers/SiamDT/checkpoints/siamdt_swin_tiny_sgd.pth").exists()
+        val_dir = Path("/content/runtime/Anti-UAV410/data/Anti-UAV410/val")
+        val_ready = val_dir.exists() and sum(1 for p in val_dir.iterdir() if p.is_dir()) >= 40
+        if ckpt_ready and val_ready:
+            print(f"\n>>> [{beijing_time_str()}] Step 1/5 已在 /content/runtime 就绪，秒级跳过！", flush=True)
+            state["steps_history"].append({
+                "step_index": 1,
+                "title": steps_plan[0][0],
+                "returncode": 0,
+                "elapsed_sec": 0.1,
+                "finished_at_beijing": beijing_time_str(),
+            })
+            write_wave_progress(state)
+        else:
+            _run_step(1, steps_plan[0][0], [sys.executable, init_script, "--run-cell", "1,2,3"])
 
         # Step 2: Cell 4 (Environment Setup)
         _run_step(2, steps_plan[1][0], [sys.executable, init_script, "--run-cell", "4"])
