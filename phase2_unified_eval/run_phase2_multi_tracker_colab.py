@@ -744,6 +744,8 @@ def inspect_phase2_status(
                 full_frames_ready_seqs.append(s)
             elif exp_f == 0 and jpg_cnt > 0:
                 full_frames_ready_seqs.append(s)
+            elif ds_info.get("archive_exists"):
+                full_frames_ready_seqs.append(s)
             else:
                 missing_val_seqs.append(s)
         else:
@@ -876,29 +878,35 @@ def stage_repos_and_weights(
             "runtime_repo": None,
         }
 
-        # 1. 克隆源码仓库至 Google Drive 冷备区（已存在源码目录则不重复克隆）
-        if not repo_drive.exists():
-            repo_drive.parent.mkdir(parents=True, exist_ok=True)
-            print(f"[{tk}] 正在克隆源码仓库 {spec['git_url']} -> {repo_drive} ...")
+        # 1. 在 Colab 运行期优先直接克隆至本地高速盘 /content/runtime/repos/...（规避 Drive 半同步目录问题）
+        runtime_repo = runtime_root / spec["repo_rel_dir"]
+        clone_rel = "repos/core_pool/UTPTrack" if spec["repo_rel_dir"].startswith("repos/core_pool/UTPTrack/") else spec["repo_rel_dir"]
+        clone_target = (runtime_root if is_colab_runtime() else drive_root) / clone_rel
+
+        if is_colab_runtime() and tk == "SiamDT_Baseline" and Path("/content/runtime/Anti-UAV410/trackers/SiamDT").exists() and not runtime_repo.exists():
+            runtime_repo.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(Path("/content/runtime/Anti-UAV410"), runtime_repo, ignore=shutil.ignore_patterns(".git"), dirs_exist_ok=True)
+            tk_res["repo_status"] = "COPIED_FROM_PATCHED_RUNTIME_ANTIUAV410"
+            tk_res["runtime_repo"] = str(runtime_repo)
+        elif not (runtime_repo if is_colab_runtime() else repo_drive).exists():
+            clone_target.parent.mkdir(parents=True, exist_ok=True)
+            print(f"[{tk}] 正在克隆源码仓库 {spec['git_url']} -> {clone_target} ...")
             try:
+                if clone_target.exists():
+                    shutil.rmtree(clone_target, ignore_errors=True)
                 subprocess.run(
-                    ["git", "clone", "--depth", "1", spec["git_url"], str(repo_drive)],
+                    ["git", "clone", "--depth", "1", spec["git_url"], str(clone_target)],
                     check=True,
                     timeout=300,
                 )
                 if spec["pinned_commit"] != "HEAD":
-                    subprocess.run(["git", "-C", str(repo_drive), "fetch", "--unshallow"], check=False)
-                    subprocess.run(["git", "-C", str(repo_drive), "checkout", spec["pinned_commit"]], check=True)
+                    subprocess.run(["git", "-C", str(clone_target), "fetch", "--unshallow"], check=False)
+                    subprocess.run(["git", "-C", str(clone_target), "checkout", spec["pinned_commit"]], check=True)
                 tk_res["repo_status"] = "CLONED_SUCCESS"
             except Exception as exc:
                 tk_res["repo_status"] = f"CLONE_FAILED: {exc}"
 
-        # 2. 若在 Colab 运行期，将源码同步至本地高速盘 /content/runtime/
-        if sync_to_runtime and repo_drive.exists() and is_colab_runtime():
-            runtime_repo = runtime_root / spec["repo_rel_dir"]
-            if not runtime_repo.exists():
-                runtime_repo.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copytree(repo_drive, runtime_repo, dirs_exist_ok=True)
+        if is_colab_runtime() and runtime_repo.exists():
             tk_res["runtime_repo"] = str(runtime_repo)
 
         # 3. 逐个核验或拉取权重文件（精确文件名 + 字节数）
@@ -2115,11 +2123,26 @@ def _spawn_tracker_shard_worker(
         py_bin = sys.executable
     runtime_repo = runtime_root / spec["repo_rel_dir"]
     drive_repo = drive_root / spec["repo_rel_dir"]
-    if is_colab_runtime() and not runtime_repo.exists() and drive_repo.exists():
-        # 运行期会在仓库里写 local.py / consts.yaml / checkpoints 链接，必须用本地盘副本，避免改动 Drive 冷备
-        print(f"[{tracker_name}] 同步源码到本地盘 {runtime_repo} ...", flush=True)
-        runtime_repo.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(drive_repo, runtime_repo, ignore=shutil.ignore_patterns(".git"), dirs_exist_ok=True)
+    if is_colab_runtime() and not runtime_repo.exists():
+        # 优先在 Colab 本地盘直接从 GitHub 克隆完整源码（或复用 Cell 2 已打补丁的 /content/runtime/Anti-UAV410），规避 Drive 半同步目录
+        if tracker_name == "SiamDT_Baseline" and Path("/content/runtime/Anti-UAV410/trackers/SiamDT").exists():
+            runtime_repo.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(Path("/content/runtime/Anti-UAV410"), runtime_repo, ignore=shutil.ignore_patterns(".git"), dirs_exist_ok=True)
+        else:
+            clone_rel = "repos/core_pool/UTPTrack" if spec["repo_rel_dir"].startswith("repos/core_pool/UTPTrack/") else spec["repo_rel_dir"]
+            clone_target = runtime_root / clone_rel
+            clone_target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                if clone_target.exists():
+                    shutil.rmtree(clone_target, ignore_errors=True)
+                subprocess.run(["git", "clone", "--depth", "1", spec["git_url"], str(clone_target)], check=True, timeout=300)
+                if spec["pinned_commit"] != "HEAD":
+                    subprocess.run(["git", "-C", str(clone_target), "fetch", "--unshallow"], check=False)
+                    subprocess.run(["git", "-C", str(clone_target), "checkout", spec["pinned_commit"]], check=True)
+            except Exception:
+                if drive_repo.exists():
+                    runtime_repo.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copytree(drive_repo, runtime_repo, ignore=shutil.ignore_patterns(".git"), dirs_exist_ok=True)
     repo_dir = runtime_repo if runtime_repo.exists() else drive_repo
     weight_dir = drive_root / spec["weight_rel_dir"]
     aux = {wf["role"]: str(drive_root / wf["rel_path"]) for wf in spec.get("weight_files", []) if wf["role"] != "primary"}

@@ -328,16 +328,15 @@ def _try_git_sync_stage_repo() -> None:
     if not SIMDT_GITHUB_REPO:
         return
     try:
-        if not (RUNTIME_STAGE_REPO / ".git").exists():
-            if (PERSIST_STAGE_REPO / ".git").exists():
-                print(f"[Stage-Git] 先从 Drive 冷备恢复 {PERSIST_STAGE_REPO} -> {RUNTIME_STAGE_REPO} ...")
-                shutil.copytree(PERSIST_STAGE_REPO, RUNTIME_STAGE_REPO, dirs_exist_ok=True)
-            else:
-                print(f"[Stage-Git] 正在从 GitHub 克隆阶段代码库: {SIMDT_GITHUB_REPO} ...")
-                subprocess.run(
-                    ["git", "clone", SIMDT_GITHUB_REPO, str(RUNTIME_STAGE_REPO)],
-                    check=True, timeout=180
-                )
+        r_check = subprocess.run(["git", "-C", str(RUNTIME_STAGE_REPO), "rev-parse", "HEAD"], capture_output=True, text=True) if (RUNTIME_STAGE_REPO / ".git").exists() else None
+        if r_check is None or r_check.returncode != 0:
+            if RUNTIME_STAGE_REPO.exists():
+                shutil.rmtree(RUNTIME_STAGE_REPO, ignore_errors=True)
+            print(f"[Stage-Git] 正在从 GitHub 克隆阶段代码库: {SIMDT_GITHUB_REPO} ...")
+            subprocess.run(
+                ["git", "clone", SIMDT_GITHUB_REPO, str(RUNTIME_STAGE_REPO)],
+                check=True, timeout=180
+            )
         # 拉取全部分支与阶段 Tag
         subprocess.run(
             ["git", "-C", str(RUNTIME_STAGE_REPO), "remote", "set-url", "origin", SIMDT_GITHUB_REPO],
@@ -361,8 +360,8 @@ def _try_git_sync_stage_repo() -> None:
                 ["git", "-C", str(RUNTIME_STAGE_REPO), "pull", "--ff-only", "origin", SIMDT_GIT_REF],
                 check=False, timeout=120
             )
-        # 备份最新阶段代码到 Google Drive 冷备目录
-        shutil.copytree(RUNTIME_STAGE_REPO, PERSIST_STAGE_REPO, dirs_exist_ok=True)
+        # 备份最新阶段代码到 Google Drive 冷备目录（忽略 .git 避免产生大量小文件阻塞云盘同步）
+        shutil.copytree(RUNTIME_STAGE_REPO, PERSIST_STAGE_REPO, ignore=shutil.ignore_patterns(".git"), dirs_exist_ok=True)
         stage_sync_status["sync_mode"] = "GITHUB_LIVE_SYNCED"
     except Exception as exc:
         print(f"[Stage-Git 提示] GitHub 远端拉取未就绪或需要鉴权 ({exc})，尝试使用 Drive 冷备...")
@@ -412,24 +411,30 @@ RUNTIME_REPO = RUNTIME_ROOT / "Anti-UAV410"
 OFFICIAL_URL = "https://github.com/HwangBo94/Anti-UAV410.git"
 PINNED_COMMIT = "8a8eb04d976e9386b7c9c3ada5c85e5086013d52"
 
-# 1. 若旧版目录 code/Anti-UAV410 已存在且新版未初始化，优先复制复用，避免重复 git clone
-if not (PERSIST_REPO / ".git").exists():
-    if (LEGACY_REPO / ".git").exists():
-        print(f"[复用] 发现已有旧版官方仓库 {LEGACY_REPO}，正在无损同步至 {PERSIST_REPO}...")
-        shutil.copytree(LEGACY_REPO, PERSIST_REPO, dirs_exist_ok=True)
+# 1. 直接在 Colab 本地高速盘 /content/runtime/Anti-UAV410 克隆并锁定官方 Commit（规避 Drive FUSE 半同步 .git 目录导致 exit 128）
+def _is_valid_git_repo(p: Path) -> bool:
+    if not (p / ".git").exists():
+        return False
+    r = subprocess.run(["git", "-C", str(p), "rev-parse", "HEAD"], capture_output=True, text=True)
+    return r.returncode == 0
+
+if not _is_valid_git_repo(RUNTIME_REPO):
+    if RUNTIME_REPO.exists():
+        shutil.rmtree(RUNTIME_REPO, ignore_errors=True)
+    if _is_valid_git_repo(PERSIST_REPO):
+        print(f"[复用] 从完整 Drive 冷备恢复 {PERSIST_REPO} -> {RUNTIME_REPO} ...")
+        shutil.copytree(PERSIST_REPO, RUNTIME_REPO, dirs_exist_ok=True)
+    elif _is_valid_git_repo(LEGACY_REPO):
+        print(f"[复用] 从已有旧版仓库恢复 {LEGACY_REPO} -> {RUNTIME_REPO} ...")
+        shutil.copytree(LEGACY_REPO, RUNTIME_REPO, dirs_exist_ok=True)
     else:
-        print(f"[克隆] 从官方仓库克隆 {OFFICIAL_URL} ...")
-        subprocess.run(["git", "clone", OFFICIAL_URL, str(PERSIST_REPO)], check=True)
+        print(f"[克隆] 直接从 GitHub 克隆官方仓库至本地高速盘 {RUNTIME_REPO} ...")
+        subprocess.run(["git", "clone", OFFICIAL_URL, str(RUNTIME_REPO)], check=True)
 
 # 锁定官方 Commit
-subprocess.run(["git", "-C", str(PERSIST_REPO), "checkout", PINNED_COMMIT], check=True)
-head_commit = subprocess.check_output(["git", "-C", str(PERSIST_REPO), "rev-parse", "HEAD"], text=True).strip()
+subprocess.run(["git", "-C", str(RUNTIME_REPO), "checkout", PINNED_COMMIT], check=True)
+head_commit = subprocess.check_output(["git", "-C", str(RUNTIME_REPO), "rev-parse", "HEAD"], text=True).strip()
 assert head_commit == PINNED_COMMIT, f"Commit 不匹配: {head_commit} != {PINNED_COMMIT}"
-
-# 2. 将官方源码同步到 Colab 本地高速盘 /content/runtime/Anti-UAV410
-if not (RUNTIME_REPO / ".git").exists():
-    print(f"[同步] 将官方源码复制到本地高速运行盘 {RUNTIME_REPO} ...")
-    shutil.copytree(PERSIST_REPO, RUNTIME_REPO, dirs_exist_ok=True)
 
 # 3. 施加 3 项最小非语义兼容补丁（仅作用于 /content/runtime，并生成审计补丁文件存入 Drive）
 patches_applied = []
@@ -476,6 +481,12 @@ if innov_dir.exists():
                 dst_item = dst_sub / item.name
                 shutil.copy2(item, dst_item)
                 stage_sync_status["mounted_innovations"].append(str(dst_item))
+
+# 同步一份到 /content/runtime/repos/Anti-UAV410_official 供 run_phase2_multi_tracker_colab.py 直接使用
+runtime_phase2_siamdt = RUNTIME_ROOT / "repos/Anti-UAV410_official"
+if not runtime_phase2_siamdt.exists():
+    runtime_phase2_siamdt.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(RUNTIME_REPO, runtime_phase2_siamdt, ignore=shutil.ignore_patterns(".git"), dirs_exist_ok=True)
 
 diff_output = subprocess.check_output(["git", "-C", str(RUNTIME_REPO), "diff"], text=True)
 patch_file = DRIVE_ROOT / "repos/patches" / f"runtime_compat_{PINNED_COMMIT[:8]}.patch"
@@ -552,22 +563,22 @@ for name, spec in OFFICIAL_ASSETS.items():
     target = spec["target_path"]
     target.parent.mkdir(parents=True, exist_ok=True)
 
-    # 若目标不存在，先从旧目录查找并无损复制（不删除原文件）
-    if not target.exists():
+    # 若目标不存在或大小不完整，先从旧目录查找并无损复制（不删除原文件）
+    if not target.exists() or target.stat().st_size != spec["expected_bytes"]:
         for legacy in spec["legacy_search"]:
             if legacy.exists() and legacy.stat().st_size == spec["expected_bytes"]:
                 print(f"[复用] 从已有路径复用 {legacy} -> {target}")
                 shutil.copy2(legacy, target)
                 break
 
-    # 若仍不存在，检查是否有已下载的 checkpoints.zip 或使用 gdown 下载
-    if not target.exists():
+    # 若仍不存在或大小不完整，检查是否有已下载的 checkpoints.zip 或使用 gdown 下载
+    if not target.exists() or target.stat().st_size != spec["expected_bytes"]:
         import gdown
         if spec["is_zip"]:
             zpath = spec["zip_path"]
             if not zpath.exists() and (DRIVE_ROOT / "archives/checkpoints.zip").exists():
                 zpath = DRIVE_ROOT / "archives/checkpoints.zip"
-            if not zpath.exists():
+            if not zpath.exists() or zpath.stat().st_size < 1000000:
                 zpath.parent.mkdir(parents=True, exist_ok=True)
                 gdown.download(id=spec["gdrive_id"], output=str(zpath), resume=True, quiet=False)
             with zipfile.ZipFile(zpath, "r") as zf:
