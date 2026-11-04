@@ -1,27 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Phase 2 三层失败提取器与跨算法统一挑战时间窗构建器 (failure_episode_extractor.py)
+Phase 2 三层失败提取器与挑战时间窗构建器 (failure_episode_extractor.py) —— v1.1（2026-11-04 修订）
 ================================================================================
-严格实现《PHASE2_FAILURE_DEFINITION_PROTOCOL.md》预先定义并冻结的判定标准：
+严格实现《PHASE2_FAILURE_DEFINITION_PROTOCOL.md》（v1.1-phase2-protocol-rev20261104）：
 1. Level 1 (Sequence): SA、存在帧 Mean IoU、ZOR、FR(0.10)、PR@20px、NPR@0.5、消失期误报率及 SA 失分四项可加拆解；
-2. Level 2 (Frame):
-   - exist == 1: ZERO_OVERLAP_LOST (IoU=0.0) / FAILURE_FRAME (IoU<0.10) / IMPRECISE (0.10<=IoU<0.50) / HIGH_QUALITY (IoU>=0.50)
-   - exist == 0: false_positive_in_absent 统计 + Post-Absence Re-acquisition Latency (重入后连续 K_rec=5 帧 IoU>=0.50 延迟帧数)
-   - 预注册敏感性分析: tau in {0.0, 0.10, 0.30, 0.50}, NCE > 1.0, 以及复合准则 (IoU < 0.10 or NCE > 1.0)
-3. Level 3 (Failure Episode):
-   - 允许桥接 <= g_bridge=3 帧瞬时偶发波动，聚合连续失败段 [t_start, t_end]
-   - 提取前导退化窗口 Pre-failure Context [t_start-15, t_start-1] 与恢复状态判定 (Recovered vs. Partial vs. Unrecovered Terminal Drift)
-4. Canonical Challenge Windows (跨算法统一挑战时间窗):
-   - 将所有被测算法在同一序列上的 Failure Episodes 与真值消失重入窗口取时间并集（间隔 <= 5 帧合并）并扩展 [-15, +10] 上下文
-   - 在完全对齐的时间窗内评估各算法的存活/自救/失锁状态，自动标注 Type A / Type B (Rescue) / Type C / Type D 事件。
+2. Level 2 (Frame): 四态分类、消失期误报与重入延迟、预注册敏感性分析（tau ∈ {0.0, 0.10, 0.30, 0.50}、NCE > 1.0、复合准则）；
+3. Level 3 (Failure Episode): g_bridge=3 桥接、前导 15 帧上下文、恢复状态判定（以上三层与 v1.0 冻结协议完全一致）；
+4. 挑战时间窗（2026-11-04 修订，依据 Claude × Gemini 交叉审查 P0-7）：
+   - 【主口径】Subject-Anchored Windows：窗口边界仅由 SiamDT_Baseline 自身的失败 episode（加前后上下文）决定，
+     与参与算法集合无关 —— 后加入的算法不会改变已锁定的窗口（输出 window_set_sha256 便于核验）；
+   - 【补充视图】Pool-Union Windows：v1.0 的"全部算法失败段 + GT 消失重入"并集窗口，输出 tracker_set 及其 sha256；
+   - 存活率分轨：in_domain_peer_survival_rate（group1 同域）与 zero_shot_peer_survival_rate（group2 零样本）分别计算，
+     并给出 best_peer / best_in_domain_peer / best_zero_shot_peer；Type A/B/C/D/D0/E/U/X 按分轨规则判定（见 CLASSIFICATION_RULES_DOC）；
+5. Holdout 封存护栏：默认拒绝读取 holdout 序列（holdout_verification.json ∪ val90_full.holdout_full_36），
+   需 --unlock-holdout 才放行，解封结果写入独立的 <output_dir>__HOLDOUT_UNSEALED 目录。
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -668,284 +671,371 @@ def analyze_single_sequence(
         },
     }
 
+# ==============================================================================
+# 分轨注册表与窗口判定常量（2026-11-04 修订冻结，见协议文档第三章 3.0 修订记录）
+# ==============================================================================
+PROTOCOL_VERSION: str = "v1.1-phase2-protocol-rev20261104"
 
-# ==============================================================================
-# 跨算法统一挑战时间窗 (Canonical Challenge Windows) 构建器
-# ==============================================================================
-def build_canonical_challenge_windows(
-    tracker_seq_rows: Dict[str, Dict[str, List[Dict[str, Any]]]],
-    tracker_seq_analysis: Dict[str, Dict[str, Dict[str, Any]]],
-    split_manifest: Dict[str, Any],
-    anchor_tracker: str = "SiamDT_Baseline",
-    merge_gap: int = CANONICAL_MERGE_GAP,
-    pre_pad: int = CANONICAL_PRE_PAD,
-    post_pad: int = CANONICAL_POST_PAD,
+GROUP_SUBJECT = "subject"
+GROUP_IN_DOMAIN = "group1_in_domain"
+GROUP_ZERO_SHOT = "group2_zero_shot"
+GROUP_UNASSIGNED = "unassigned"
+VALID_GROUPS = (GROUP_SUBJECT, GROUP_IN_DOMAIN, GROUP_ZERO_SHOT, GROUP_UNASSIGNED)
+
+# 名称规范化（小写、去掉非字母数字）后按前缀匹配；未匹配的算法记为 unassigned，
+# 不计入任何一轨的存活率，并在输出中显式列出（绝不静默归组）。
+DEFAULT_TRACKER_GROUP_PREFIXES: Tuple[Tuple[str, str], ...] = (
+    ("FocusTrack", GROUP_IN_DOMAIN),
+    ("MemLoTrack", GROUP_IN_DOMAIN),
+    ("DAM4SAM", GROUP_ZERO_SHOT),
+    ("SAMOSA", GROUP_ZERO_SHOT),
+    ("SAMURAI", GROUP_ZERO_SHOT),
+    ("UETrack", GROUP_ZERO_SHOT),
+    ("SUTrack", GROUP_ZERO_SHOT),
+    ("UTPTrack", GROUP_ZERO_SHOT),
+    ("ReFocus", GROUP_ZERO_SHOT),
+)
+
+SURVIVED_STATUSES: Tuple[str, ...] = ("SUCCESS", "ROBUST_SURVIVAL")
+RECOVERED_STATUSES: Tuple[str, ...] = ("TRANSIENT_FAILURE_RECOVERED",)
+FAILED_STATUSES: Tuple[str, ...] = ("FAILED_UNRECOVERED", "TRANSIENT_FAILURE_RECOVERED")
+
+TYPE_C_IN_DOMAIN_SURVIVAL_GT: float = 0.5   # Type C：同域对手存活率严格 > 0.5（多数存活）
+TYPE_D_IN_DOMAIN_FAILURE_GT: float = 0.5    # Type D：同域对手失败率严格 > 0.5
+TYPE_D0_ZERO_SHOT_FAILURE_GT: float = 0.5   # Type D0：仅零样本对手失败率严格 > 0.5
+
+WINDOW_TYPE_KEYS: Tuple[str, ...] = (
+    "Type_A_Common_Hard_Failure",
+    "Type_B_Rescued_SiamDT_Failure",
+    "Type_C_SiamDT_Unique_Failure",
+    "Type_D_InDomain_Peer_Failure_SiamDT_Success",
+    "Type_D0_ZeroShot_Only_Peer_Failure_SiamDT_Success",
+    "Type_E_All_Survived",
+    "Type_U_No_Peer_Evidence",
+    "Type_X_Subject_Not_Evaluated",
+)
+
+CLASSIFICATION_RULES_DOC: Dict[str, str] = {
+    "survived": "窗口核心跨度内状态 ∈ {SUCCESS, ROBUST_SURVIVAL}",
+    "failed": "窗口核心跨度内状态 ∈ {FAILED_UNRECOVERED, TRANSIENT_FAILURE_RECOVERED}",
+    "rescuer": "对手 survived，或 (SiamDT 为 FAILED_UNRECOVERED 且对手为 TRANSIENT_FAILURE_RECOVERED)",
+    "Type_X": "SiamDT_Baseline 在该窗口无逐帧记录",
+    "Type_U": "两轨均无可用对手记录（不做 A/B/C/D 推断）",
+    "Type_C": f"SiamDT failed 且 同域对手数 >= 1 且 in_domain_peer_survival_rate > {TYPE_C_IN_DOMAIN_SURVIVAL_GT}（只看同域轨，零样本轨结果不影响）",
+    "Type_B": "SiamDT failed 且 非 Type_C 且 至少 1 个 rescuer（任一轨；rescue_tracks 记录来源轨）",
+    "Type_A": "SiamDT failed 且 两轨均无 rescuer",
+    "Type_D": f"SiamDT survived 且 同域对手数 >= 1 且 in_domain_peer_failure_rate > {TYPE_D_IN_DOMAIN_FAILURE_GT}",
+    "Type_D0": f"SiamDT survived 且 非 Type_D 且 零样本对手数 >= 1 且 zero_shot_peer_failure_rate > {TYPE_D0_ZERO_SHOT_FAILURE_GT}",
+    "Type_E": "SiamDT survived 且 非 D/D0",
+}
+
+
+class HoldoutSealedError(RuntimeError):
+    """Holdout 封存护栏：默认拒绝读取 holdout 序列。"""
+
+
+def _norm_name(name: str) -> str:
+    return "".join(ch for ch in str(name).lower() if ch.isalnum())
+
+
+def resolve_tracker_groups(
+    tracker_names: List[str],
+    anchor_tracker: str,
+    overrides: Optional[Dict[str, str]] = None,
+) -> Dict[str, str]:
+    """返回 {tracker: group}；overrides 优先，其次前缀注册表，否则 unassigned。"""
+    overrides = overrides or {}
+    out: Dict[str, str] = {}
+    for tk in tracker_names:
+        if tk == anchor_tracker:
+            out[tk] = GROUP_SUBJECT
+            continue
+        if tk in overrides:
+            grp = overrides[tk]
+            if grp not in VALID_GROUPS:
+                raise ValueError(f"--tracker-groups 中 {tk} 的分组 {grp} 非法，应为 {VALID_GROUPS}")
+            out[tk] = grp
+            continue
+        n = _norm_name(tk)
+        grp = GROUP_UNASSIGNED
+        for prefix, g in DEFAULT_TRACKER_GROUP_PREFIXES:
+            if n.startswith(_norm_name(prefix)):
+                grp = g
+                break
+        out[tk] = grp
+    return out
+
+
+def tracker_set_fingerprint(groups: Dict[str, str]) -> Dict[str, Any]:
+    items = [{"tracker": tk, "group": groups[tk]} for tk in sorted(groups)]
+    digest = hashlib.sha256(json.dumps(items, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+    return {"tracker_set": items, "tracker_set_sha256": digest}
+
+
+def _is_valid_present(r: Dict[str, Any]) -> bool:
+    gt = r.get("gt_bbox", [])
+    return int(r.get("exist", 1)) == 1 and len(gt) >= 4 and float(gt[2]) > 0 and float(gt[3]) > 0
+
+
+def evaluate_tracker_outcome_in_span(
+    tk_rows: List[Dict[str, Any]], u_start: int, u_end: int, ctx_end: int,
 ) -> Dict[str, Any]:
-    """
-    将所有已评测跟踪器在同一序列上的 Failure Episodes 与真值消失重入窗口取时间并集，
-    生成对所有算法 100% 对齐的 Canonical Challenge Windows，并自动判定 각算法状态与 Type A/B/C/D。
-    """
-    seq_details_map: Dict[str, Dict[str, Any]] = {}
-    for item in split_manifest.get("sequence_details", []):
-        if "seq_name" in item:
-            seq_details_map[item["seq_name"]] = item
+    """在核心跨度 [u_start, u_end] 内评估单个算法状态（阈值与 v1.0 冻结协议完全相同）。"""
+    w_rows = tk_rows[u_start: u_end + 1]
+    w_present = [r for r in w_rows if _is_valid_present(r)]
+    w_absent = [r for r in w_rows if int(r.get("exist", 1)) == 0]
+    w_sa_valid = w_present + w_absent
+    mean_sa = sum(float(r.get("sa_score", 0.0)) for r in w_sa_valid) / len(w_sa_valid) if w_sa_valid else 0.0
+    mean_iou = sum(float(r.get("iou", 0.0)) for r in w_present) / len(w_present) if w_present else 0.0
+    min_iou = min((float(r.get("iou", 0.0)) for r in w_present), default=0.0)
+    fail_cnt = sum(1 for r in w_present if float(r.get("iou", 0.0)) < PRIMARY_TAU_FAIL)
+    fail_rate = fail_cnt / len(w_present) if w_present else 0.0
+    hq_cnt = sum(1 for r in w_present if float(r.get("iou", 0.0)) >= HIGH_QUALITY_IOU)
+    hq_rate = hq_cnt / len(w_present) if w_present else 0.0
+    absent_fp_cnt = sum(1 for r in w_absent if int(r.get("pred_absent_flag", 0)) == 0)
 
-    target_sequences: List[str] = split_manifest.get("sequences", sorted(seq_details_map.keys()))
-    available_trackers = sorted(tracker_seq_rows.keys())
+    tail_start = max(u_start, u_end - (RECOVERY_CONSECUTIVE_FRAMES - 1))
+    tail_present = [r for r in tk_rows[tail_start: ctx_end + 1] if _is_valid_present(r)]
+    req_k = min(RECOVERY_CONSECUTIVE_FRAMES, len(tail_present))
+    post_locked = False
+    if req_k > 0:
+        for pos in range(0, len(tail_present) - req_k + 1):
+            if all(float(x.get("iou", 0.0)) >= RECOVERY_IOU_THRESHOLD for x in tail_present[pos: pos + req_k]):
+                post_locked = True
+                break
 
-    all_canonical_windows: List[Dict[str, Any]] = []
-    window_type_counts = {
-        "Type_A_Common_Hard_Failure": 0,
-        "Type_B_Rescued_SiamDT_Failure": 0,
-        "Type_C_SiamDT_Unique_Failure": 0,
-        "Type_D_Peer_Failure_SiamDT_Success": 0,
-        "Type_E_All_Trackers_Succeeded_Absent_Window": 0,
+    if not w_present:
+        if mean_sa >= 0.80 and post_locked:
+            status = "SUCCESS"
+        elif post_locked:
+            status = "ROBUST_SURVIVAL"
+        else:
+            status = "FAILED_UNRECOVERED"
+    else:
+        if fail_rate == 0.0 and mean_sa >= 0.50:
+            status = "SUCCESS"
+        elif fail_rate <= 0.15 and (mean_sa >= 0.35 or post_locked):
+            status = "ROBUST_SURVIVAL"
+        elif post_locked:
+            status = "TRANSIENT_FAILURE_RECOVERED"
+        else:
+            status = "FAILED_UNRECOVERED"
+    return {
+        "status": status,
+        "window_mean_sa": round(mean_sa, 6),
+        "window_mean_iou_present": round(mean_iou, 6),
+        "window_min_iou_present": round(min_iou, 6),
+        "window_failure_rate_tau010": round(fail_rate, 6),
+        "window_high_quality_rate": round(hq_rate, 6),
+        "absent_false_positives": absent_fp_cnt,
+        "post_window_locked": post_locked,
     }
 
-    for seq_id in target_sequences:
-        # 找到任意一个拥有该序列逐帧记录的算法作为真值帧参考
-        ref_rows: Optional[List[Dict[str, Any]]] = None
-        if anchor_tracker in tracker_seq_rows and seq_id in tracker_seq_rows[anchor_tracker]:
-            ref_rows = tracker_seq_rows[anchor_tracker][seq_id]
+
+def summarize_peer_tracks(
+    per_tracker_outcomes: Dict[str, Dict[str, Any]], groups: Dict[str, str],
+) -> Dict[str, Any]:
+    """按同域 / 零样本两轨分别统计对手存活、恢复、失败与最佳对手。"""
+    def _track(group: str) -> Dict[str, Any]:
+        names = sorted(tk for tk, g in groups.items() if g == group and tk in per_tracker_outcomes)
+        survived = [tk for tk in names if per_tracker_outcomes[tk]["status"] in SURVIVED_STATUSES]
+        recovered = [tk for tk in names if per_tracker_outcomes[tk]["status"] in RECOVERED_STATUSES]
+        failed = [tk for tk in names if per_tracker_outcomes[tk]["status"] in FAILED_STATUSES]
+        n = len(names)
+        best = max(names, key=lambda tk: per_tracker_outcomes[tk]["window_mean_sa"]) if names else None
+        return {
+            "evaluated": names,
+            "survived": survived,
+            "recovered": recovered,
+            "failed": failed,
+            "survival_rate": round(len(survived) / n, 6) if n else None,
+            "failure_rate": round(len(failed) / n, 6) if n else None,
+            "best_peer": (
+                {"tracker": best, "group": group, "status": per_tracker_outcomes[best]["status"],
+                 "window_mean_sa": per_tracker_outcomes[best]["window_mean_sa"]} if best else None
+            ),
+        }
+
+    ind = _track(GROUP_IN_DOMAIN)
+    zs = _track(GROUP_ZERO_SHOT)
+    cands = [b for b in (ind["best_peer"], zs["best_peer"]) if b]
+    best_overall = max(cands, key=lambda b: b["window_mean_sa"]) if cands else None
+    unassigned = sorted(tk for tk, g in groups.items() if g == GROUP_UNASSIGNED and tk in per_tracker_outcomes)
+    return {"in_domain": ind, "zero_shot": zs, "best_peer": best_overall, "unassigned_excluded": unassigned}
+
+
+def classify_window_type(
+    anchor_out: Optional[Dict[str, Any]],
+    per_tracker_outcomes: Dict[str, Dict[str, Any]],
+    groups: Dict[str, str],
+) -> Dict[str, Any]:
+    """分轨判定 Type A/B/C/D/D0/E/U/X（规则见 CLASSIFICATION_RULES_DOC）。"""
+    tracks = summarize_peer_tracks(per_tracker_outcomes, groups)
+    ind, zs = tracks["in_domain"], tracks["zero_shot"]
+    n_in, n_zs = len(ind["evaluated"]), len(zs["evaluated"])
+    rescuers: List[str] = []
+    rescue_tracks: List[str] = []
+    if anchor_out is None:
+        wtype = "Type_X_Subject_Not_Evaluated"
+    elif n_in == 0 and n_zs == 0:
+        wtype = "Type_U_No_Peer_Evidence"
+    elif anchor_out["status"] in FAILED_STATUSES:
+        for label, tr in (("in_domain", ind), ("zero_shot", zs)):
+            for tk in tr["evaluated"]:
+                st = per_tracker_outcomes[tk]["status"]
+                if st in SURVIVED_STATUSES or (anchor_out["status"] == "FAILED_UNRECOVERED" and st in RECOVERED_STATUSES):
+                    rescuers.append(tk)
+                    if label not in rescue_tracks:
+                        rescue_tracks.append(label)
+        if n_in >= 1 and ind["survival_rate"] is not None and ind["survival_rate"] > TYPE_C_IN_DOMAIN_SURVIVAL_GT:
+            wtype = "Type_C_SiamDT_Unique_Failure"
+        elif rescuers:
+            wtype = "Type_B_Rescued_SiamDT_Failure"
         else:
-            for tk in available_trackers:
-                if seq_id in tracker_seq_rows[tk]:
-                    ref_rows = tracker_seq_rows[tk][seq_id]
-                    break
-        if not ref_rows:
-            continue
-
-        total_f = len(ref_rows)
-        seed_intervals: List[Tuple[int, int, str]] = []
-
-        # 1. 收集所有算法在该序列上的主失败事件段 [t_start, t_end]
-        for tk in available_trackers:
-            seq_ana = tracker_seq_analysis.get(tk, {}).get(seq_id)
-            if not seq_ana:
-                continue
-            eps = seq_ana["level3_failure_episodes_summary"]["episodes"]
-            for ep in eps:
-                seed_intervals.append((int(ep["t_start"]), int(ep["t_end"]), f"failure:{tk}"))
-
-        # 2. 收集真值目标消失与重入考题区间 [t_abs_start, min(T-1, t_abs_end + 15)]
-        i = 0
-        while i < total_f:
-            if int(ref_rows[i].get("exist", 1)) == 0:
-                a_start = int(ref_rows[i].get("frame_id", i))
-                while i < total_f and int(ref_rows[i].get("exist", 1)) == 0:
-                    i += 1
-                a_end = int(ref_rows[i - 1].get("frame_id", i - 1))
-                seed_end = min(total_f - 1, a_end + ABSENT_REENTRY_SEED_HORIZON)
-                seed_intervals.append((a_start, seed_end, "gt_absence_reentry"))
-            else:
-                i += 1
-
-        if not seed_intervals:
-            continue
-
-        # 3. 按起始帧排序并合并间隔 <= merge_gap (5) 帧的区间
-        seed_intervals.sort(key=lambda x: (x[0], x[1]))
-        merged_spans: List[Dict[str, Any]] = []
-        for s_start, s_end, src_tag in seed_intervals:
-            if not merged_spans:
-                merged_spans.append({
-                    "u_start": s_start,
-                    "u_end": s_end,
-                    "triggers": [src_tag],
-                })
-            else:
-                prev = merged_spans[-1]
-                if s_start <= prev["u_end"] + merge_gap + 1:
-                    prev["u_end"] = max(prev["u_end"], s_end)
-                    if src_tag not in prev["triggers"]:
-                        prev["triggers"].append(src_tag)
-                else:
-                    merged_spans.append({
-                        "u_start": s_start,
-                        "u_end": s_end,
-                        "triggers": [src_tag],
-                    })
-
-        # 4. 为每个合并后的核心跨度扩展上下文并计算各算法在窗口内的表现
-        s_meta = seq_details_map.get(seq_id, {})
-        for w_idx, mspan in enumerate(merged_spans, start=1):
-            u_start = int(mspan["u_start"])
-            u_end = int(mspan["u_end"])
-            ctx_start = max(1, u_start - pre_pad)
-            ctx_end = min(total_f - 1, u_end + post_pad)
-
-            # 统计窗口内真值物理特征（尺寸、消失帧数、帧间位移）
-            core_rows_ref = ref_rows[u_start : u_end + 1]
-            core_present_ref = [
-                r for r in core_rows_ref
-                if int(r.get("exist", 1)) == 1
-                and len(r.get("gt_bbox", [])) >= 4
-                and float(r["gt_bbox"][2]) > 0
-                and float(r["gt_bbox"][3]) > 0
-            ]
-            core_absent_cnt = sum(1 for r in core_rows_ref if int(r.get("exist", 1)) == 0)
-            core_sizes = [float(r.get("target_size", 0.0)) for r in core_present_ref if float(r.get("target_size", 0.0)) > 0]
-
-            per_tracker_outcomes: Dict[str, Any] = {}
-            for tk in available_trackers:
-                tk_rows = tracker_seq_rows.get(tk, {}).get(seq_id)
-                if not tk_rows or len(tk_rows) <= u_end:
-                    continue
-                w_rows = tk_rows[u_start : u_end + 1]
-                w_present = [
-                    r for r in w_rows
-                    if int(r.get("exist", 1)) == 1
-                    and len(r.get("gt_bbox", [])) >= 4
-                    and float(r["gt_bbox"][2]) > 0
-                    and float(r["gt_bbox"][3]) > 0
-                ]
-                w_absent = [r for r in w_rows if int(r.get("exist", 1)) == 0]
-                w_sa_valid = w_present + w_absent
-
-                mean_sa = (
-                    sum(float(r.get("sa_score", 0.0)) for r in w_sa_valid) / len(w_sa_valid)
-                    if w_sa_valid else 0.0
-                )
-                mean_iou = (
-                    sum(float(r.get("iou", 0.0)) for r in w_present) / len(w_present)
-                    if w_present else 0.0
-                )
-                min_iou = min((float(r.get("iou", 0.0)) for r in w_present), default=0.0)
-                fail_cnt = sum(1 for r in w_present if float(r.get("iou", 0.0)) < PRIMARY_TAU_FAIL)
-                fail_rate = fail_cnt / len(w_present) if w_present else 0.0
-                hq_cnt = sum(1 for r in w_present if float(r.get("iou", 0.0)) >= HIGH_QUALITY_IOU)
-                hq_rate = hq_cnt / len(w_present) if w_present else 0.0
-                absent_fp_cnt = sum(1 for r in w_absent if int(r.get("pred_absent_flag", 0)) == 0)
-
-                # 检查窗口末端及后置观测区间 [max(u_start, u_end-4), ctx_end] 是否达成连续 >=5 帧高质锁定
-                tail_start = max(u_start, u_end - (RECOVERY_CONSECUTIVE_FRAMES - 1))
-                tail_present = [
-                    r for r in tk_rows[tail_start : ctx_end + 1]
-                    if int(r.get("exist", 1)) == 1
-                    and len(r.get("gt_bbox", [])) >= 4
-                    and float(r["gt_bbox"][2]) > 0
-                    and float(r["gt_bbox"][3]) > 0
-                ]
-                req_k = min(RECOVERY_CONSECUTIVE_FRAMES, len(tail_present))
-                post_locked = False
-                if req_k > 0:
-                    for pos in range(0, len(tail_present) - req_k + 1):
-                        if all(float(x.get("iou", 0.0)) >= RECOVERY_IOU_THRESHOLD for x in tail_present[pos : pos + req_k]):
-                            post_locked = True
-                            break
-
-                # 如果整个核心窗口全是 absent 帧（无 present 帧），则以 mean_sa 与 post_locked 判定
-                if not w_present:
-                    if mean_sa >= 0.80 and post_locked:
-                        status_label = "SUCCESS"
-                    elif post_locked:
-                        status_label = "ROBUST_SURVIVAL"
-                    else:
-                        status_label = "FAILED_UNRECOVERED"
-                else:
-                    if fail_rate == 0.0 and mean_sa >= 0.50:
-                        status_label = "SUCCESS"
-                    elif fail_rate <= 0.15 and (mean_sa >= 0.35 or post_locked):
-                        status_label = "ROBUST_SURVIVAL"
-                    elif post_locked:
-                        status_label = "TRANSIENT_FAILURE_RECOVERED"
-                    else:
-                        status_label = "FAILED_UNRECOVERED"
-
-                per_tracker_outcomes[tk] = {
-                    "status": status_label,
-                    "window_mean_sa": round(mean_sa, 6),
-                    "window_mean_iou_present": round(mean_iou, 6),
-                    "window_min_iou_present": round(min_iou, 6),
-                    "window_failure_rate_tau010": round(fail_rate, 6),
-                    "window_high_quality_rate": round(hq_rate, 6),
-                    "absent_false_positives": absent_fp_cnt,
-                    "post_window_locked": post_locked,
-                }
-
-            # 判定相对于 anchor_tracker (SiamDT_Baseline) 的 Type A / B / C / D 类别
-            anchor_out = per_tracker_outcomes.get(anchor_tracker)
-            peer_trackers = [tk for tk in per_tracker_outcomes.keys() if tk != anchor_tracker]
-
-            rescuing_trackers: List[str] = []
-            best_rescuer: Optional[str] = None
-            best_rescuer_sa: float = -1.0
-
-            if anchor_out:
-                anchor_failed = anchor_out["status"] in ("FAILED_UNRECOVERED", "TRANSIENT_FAILURE_RECOVERED")
-                if anchor_failed:
-                    for ptk in peer_trackers:
-                        p_out = per_tracker_outcomes[ptk]
-                        # 若对比算法达到 SUCCESS / ROBUST_SURVIVAL，或当 SiamDT 完全未恢复时对比算法成功自救恢复
-                        is_rescuer = (
-                            p_out["status"] in ("SUCCESS", "ROBUST_SURVIVAL")
-                            or (
-                                anchor_out["status"] == "FAILED_UNRECOVERED"
-                                and p_out["status"] == "TRANSIENT_FAILURE_RECOVERED"
-                            )
-                        )
-                        if is_rescuer:
-                            rescuing_trackers.append(ptk)
-                            if p_out["window_mean_sa"] > best_rescuer_sa:
-                                best_rescuer_sa = p_out["window_mean_sa"]
-                                best_rescuer = ptk
-
-                    if not peer_trackers or len(rescuing_trackers) == 0:
-                        window_type = "Type_A_Common_Hard_Failure"
-                    else:
-                        robust_peers = sum(
-                            1 for ptk in peer_trackers
-                            if per_tracker_outcomes[ptk]["status"] in ("SUCCESS", "ROBUST_SURVIVAL")
-                        )
-                        if len(peer_trackers) > 0 and (robust_peers / len(peer_trackers)) >= 0.80:
-                            window_type = "Type_C_SiamDT_Unique_Failure"
-                        else:
-                            window_type = "Type_B_Rescued_SiamDT_Failure"
-                else:
-                    # SiamDT 自身稳健通过
-                    any_peer_failed = any(
-                        per_tracker_outcomes[ptk]["status"] in ("FAILED_UNRECOVERED", "TRANSIENT_FAILURE_RECOVERED")
-                        for ptk in peer_trackers
-                    )
-                    if any_peer_failed:
-                        window_type = "Type_D_Peer_Failure_SiamDT_Success"
-                    else:
-                        window_type = "Type_E_All_Trackers_Succeeded_Absent_Window"
-            else:
-                window_type = "Type_A_Common_Hard_Failure"
-
-            window_type_counts[window_type] = window_type_counts.get(window_type, 0) + 1
-
-            all_canonical_windows.append({
-                "window_id": f"{seq_id}__CW{w_idx:03d}",
-                "seq_id": seq_id,
-                "window_index_in_seq": w_idx,
-                "recording_group": s_meta.get("recording_group"),
-                "sequence_attributes": s_meta.get("attributes"),
-                "primary_challenge_tags": s_meta.get("primary_challenge_tags"),
-                "core_challenge_span": [u_start, u_end],
-                "core_duration_frames": u_end - u_start + 1,
-                "core_present_frames": len(core_present_ref),
-                "core_absent_frames": core_absent_cnt,
-                "core_mean_target_size": round(sum(core_sizes) / len(core_sizes), 4) if core_sizes else 0.0,
-                "padded_context_span": [ctx_start, ctx_end],
-                "pre_context_span": [ctx_start, max(ctx_start, u_start - 1)],
-                "post_observation_span": [min(ctx_end, u_end + 1), ctx_end],
-                "trigger_sources": mspan["triggers"],
-                "window_diagnostic_type": window_type,
-                "rescuing_trackers": rescuing_trackers,
-                "best_rescuer": best_rescuer,
-                "best_rescuer_mean_sa": round(best_rescuer_sa, 6) if best_rescuer else None,
-                "per_tracker_outcomes": per_tracker_outcomes,
-            })
-
+            wtype = "Type_A_Common_Hard_Failure"
+    else:
+        if n_in >= 1 and ind["failure_rate"] is not None and ind["failure_rate"] > TYPE_D_IN_DOMAIN_FAILURE_GT:
+            wtype = "Type_D_InDomain_Peer_Failure_SiamDT_Success"
+        elif n_zs >= 1 and zs["failure_rate"] is not None and zs["failure_rate"] > TYPE_D0_ZERO_SHOT_FAILURE_GT:
+            wtype = "Type_D0_ZeroShot_Only_Peer_Failure_SiamDT_Success"
+        else:
+            wtype = "Type_E_All_Survived"
     return {
-        "schema_version": "1.0.0",
-        "protocol_version": "v1.0-phase2-protocol-frozen",
+        "window_diagnostic_type": wtype,
+        "rescuing_trackers": sorted(rescuers),
+        "rescue_tracks": rescue_tracks,
+        "type_c_evidence_note": ("single_in_domain_peer" if n_in == 1 else ("no_in_domain_peer" if n_in == 0 else "multi_in_domain_peers")),
+        "in_domain_peer_survival_rate": ind["survival_rate"],
+        "zero_shot_peer_survival_rate": zs["survival_rate"],
+        "in_domain_peer_failure_rate": ind["failure_rate"],
+        "zero_shot_peer_failure_rate": zs["failure_rate"],
+        "best_peer": tracks["best_peer"],
+        "best_in_domain_peer": ind["best_peer"],
+        "best_zero_shot_peer": zs["best_peer"],
+        "peer_evidence": {
+            "in_domain": {k: ind[k] for k in ("evaluated", "survived", "recovered", "failed")},
+            "zero_shot": {k: zs[k] for k in ("evaluated", "survived", "recovered", "failed")},
+            "unassigned_excluded": tracks["unassigned_excluded"],
+        },
+    }
+
+
+# ==============================================================================
+# 窗口构建（主口径 Subject-Anchored + 补充视图 Pool-Union）
+# ==============================================================================
+def _merge_seed_intervals(seed_intervals: List[Tuple[int, int, str]], merge_gap: int) -> List[Dict[str, Any]]:
+    seed_intervals = sorted(seed_intervals, key=lambda x: (x[0], x[1]))
+    merged: List[Dict[str, Any]] = []
+    for s_start, s_end, tag in seed_intervals:
+        if merged and s_start <= merged[-1]["u_end"] + merge_gap + 1:
+            merged[-1]["u_end"] = max(merged[-1]["u_end"], s_end)
+            if tag not in merged[-1]["triggers"]:
+                merged[-1]["triggers"].append(tag)
+        else:
+            merged.append({"u_start": s_start, "u_end": s_end, "triggers": [tag]})
+    return merged
+
+
+def _gt_absence_seed_intervals(ref_rows: List[Dict[str, Any]]) -> List[Tuple[int, int, str]]:
+    seeds: List[Tuple[int, int, str]] = []
+    total_f = len(ref_rows)
+    i = 0
+    while i < total_f:
+        if int(ref_rows[i].get("exist", 1)) == 0:
+            a_start = int(ref_rows[i].get("frame_id", i))
+            while i < total_f and int(ref_rows[i].get("exist", 1)) == 0:
+                i += 1
+            a_end = int(ref_rows[i - 1].get("frame_id", i - 1))
+            seeds.append((a_start, min(total_f - 1, a_end + ABSENT_REENTRY_SEED_HORIZON), "gt_absence_reentry"))
+        else:
+            i += 1
+    return seeds
+
+
+def _manifest_sequence_details(split_manifest: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    return {it["seq_name"]: it for it in split_manifest.get("sequence_details", []) if "seq_name" in it}
+
+
+def _build_windows_for_spans(
+    seq_id: str,
+    spans: List[Dict[str, Any]],
+    ref_rows: List[Dict[str, Any]],
+    tracker_seq_rows: Dict[str, Dict[str, List[Dict[str, Any]]]],
+    groups: Dict[str, str],
+    anchor_tracker: str,
+    s_meta: Dict[str, Any],
+    pre_pad: int,
+    post_pad: int,
+    id_tag: str,
+) -> List[Dict[str, Any]]:
+    total_f = len(ref_rows)
+    windows: List[Dict[str, Any]] = []
+    for w_idx, sp in enumerate(spans, start=1):
+        u_start, u_end = int(sp["u_start"]), int(sp["u_end"])
+        ctx_start, ctx_end = max(1, u_start - pre_pad), min(total_f - 1, u_end + post_pad)
+        core_rows = ref_rows[u_start: u_end + 1]
+        core_present = [r for r in core_rows if _is_valid_present(r)]
+        core_sizes = [float(r.get("target_size", 0.0)) for r in core_present if float(r.get("target_size", 0.0)) > 0]
+        outcomes: Dict[str, Dict[str, Any]] = {}
+        for tk in sorted(tracker_seq_rows):
+            tk_rows = tracker_seq_rows[tk].get(seq_id)
+            if not tk_rows or len(tk_rows) <= u_end:
+                continue
+            outcomes[tk] = {**evaluate_tracker_outcome_in_span(tk_rows, u_start, u_end, ctx_end), "group": groups.get(tk, GROUP_UNASSIGNED)}
+        cls = classify_window_type(outcomes.get(anchor_tracker), outcomes, groups)
+        windows.append({
+            "window_id": f"{seq_id}__{id_tag}{w_idx:03d}",
+            "seq_id": seq_id,
+            "window_index_in_seq": w_idx,
+            "recording_group": s_meta.get("recording_group"),
+            "sequence_attributes": s_meta.get("attributes"),
+            "primary_challenge_tags": s_meta.get("primary_challenge_tags"),
+            "core_challenge_span": [u_start, u_end],
+            "core_duration_frames": u_end - u_start + 1,
+            "core_present_frames": len(core_present),
+            "core_absent_frames": sum(1 for r in core_rows if int(r.get("exist", 1)) == 0),
+            "core_mean_target_size": round(sum(core_sizes) / len(core_sizes), 4) if core_sizes else 0.0,
+            "padded_context_span": [ctx_start, ctx_end],
+            "pre_context_span": [ctx_start, max(ctx_start, u_start - 1)],
+            "post_observation_span": [min(ctx_end, u_end + 1), ctx_end],
+            "trigger_sources": sp["triggers"],
+            **cls,
+            "per_tracker_outcomes": outcomes,
+        })
+    return windows
+
+
+def _windows_payload(
+    mode: str,
+    windows: List[Dict[str, Any]],
+    split_manifest: Dict[str, Any],
+    anchor_tracker: str,
+    groups: Dict[str, str],
+    merge_gap: int,
+    pre_pad: int,
+    post_pad: int,
+    boundary_note: str,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    counts = {k: 0 for k in WINDOW_TYPE_KEYS}
+    for w in windows:
+        counts[w["window_diagnostic_type"]] = counts.get(w["window_diagnostic_type"], 0) + 1
+    span_sig = [[w["window_id"], w["core_challenge_span"], w["padded_context_span"]] for w in windows]
+    fp = tracker_set_fingerprint(groups)
+    payload = {
+        "schema_version": "1.1.0",
+        "protocol_version": PROTOCOL_VERSION,
+        "window_mode": mode,
+        "is_primary_view": mode == "subject_anchored",
         "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "split_name": split_manifest.get("split_name", "unknown"),
         "anchor_tracker": anchor_tracker,
-        "evaluated_trackers": available_trackers,
+        "window_boundary_determined_by": boundary_note,
+        "evaluated_trackers": sorted(groups),
+        "tracker_groups": groups,
+        **fp,
+        "unassigned_trackers_excluded_from_tracks": sorted(tk for tk, g in groups.items() if g == GROUP_UNASSIGNED),
+        "window_set_sha256": hashlib.sha256(json.dumps(span_sig, ensure_ascii=False).encode("utf-8")).hexdigest(),
         "window_construction_params": {
             "primary_tau_fail": PRIMARY_TAU_FAIL,
             "episode_bridge_gap": BRIDGE_GAP_FRAMES,
@@ -955,12 +1045,161 @@ def build_canonical_challenge_windows(
             "recovery_consecutive_frames": RECOVERY_CONSECUTIVE_FRAMES,
             "recovery_iou_threshold": RECOVERY_IOU_THRESHOLD,
         },
+        "classification_rules": CLASSIFICATION_RULES_DOC,
         "summary": {
-            "total_canonical_windows": len(all_canonical_windows),
-            "sequences_with_windows": len({w["seq_id"] for w in all_canonical_windows}),
-            "window_type_counts": window_type_counts,
+            "total_windows": len(windows),
+            "sequences_with_windows": len({w["seq_id"] for w in windows}),
+            "window_type_counts": counts,
         },
-        "canonical_windows": all_canonical_windows,
+        "windows": windows,
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def build_subject_anchored_windows(
+    tracker_seq_rows: Dict[str, Dict[str, List[Dict[str, Any]]]],
+    tracker_seq_analysis: Dict[str, Dict[str, Dict[str, Any]]],
+    split_manifest: Dict[str, Any],
+    anchor_tracker: str = "SiamDT_Baseline",
+    tracker_groups: Optional[Dict[str, str]] = None,
+    merge_gap: int = CANONICAL_MERGE_GAP,
+    pre_pad: int = CANONICAL_PRE_PAD,
+    post_pad: int = CANONICAL_POST_PAD,
+) -> Dict[str, Any]:
+    """
+    【主口径】Subject-Anchored Windows：窗口边界只由 anchor_tracker（SiamDT_Baseline）自身的主失败 episode
+    （τ=0.10、g_bridge=3，间隔 <= merge_gap 合并）加 [-pre_pad, +post_pad] 上下文决定，与参与算法集合无关。
+    """
+    groups = tracker_groups or resolve_tracker_groups(sorted(tracker_seq_rows), anchor_tracker)
+    seq_details = _manifest_sequence_details(split_manifest)
+    windows: List[Dict[str, Any]] = []
+    missing_subject: List[str] = []
+    for seq_id in split_manifest.get("sequences", []):
+        ref_rows = tracker_seq_rows.get(anchor_tracker, {}).get(seq_id)
+        seq_ana = tracker_seq_analysis.get(anchor_tracker, {}).get(seq_id)
+        if not ref_rows or not seq_ana:
+            missing_subject.append(seq_id)
+            continue
+        seeds = [(int(ep["t_start"]), int(ep["t_end"]), f"failure:{anchor_tracker}")
+                 for ep in seq_ana["level3_failure_episodes_summary"]["episodes"]]
+        if not seeds:
+            continue
+        spans = _merge_seed_intervals(seeds, merge_gap)
+        windows.extend(_build_windows_for_spans(seq_id, spans, ref_rows, tracker_seq_rows, groups, anchor_tracker,
+                                                seq_details.get(seq_id, {}), pre_pad, post_pad, "SAW"))
+    return _windows_payload(
+        "subject_anchored", windows, split_manifest, anchor_tracker, groups, merge_gap, pre_pad, post_pad,
+        boundary_note=f"仅 {anchor_tracker} 自身主失败 episode（与参与算法集合无关）",
+        extra={"sequences_missing_subject_telemetry": missing_subject},
+    )
+
+
+def build_pool_union_challenge_windows(
+    tracker_seq_rows: Dict[str, Dict[str, List[Dict[str, Any]]]],
+    tracker_seq_analysis: Dict[str, Dict[str, Dict[str, Any]]],
+    split_manifest: Dict[str, Any],
+    anchor_tracker: str = "SiamDT_Baseline",
+    tracker_groups: Optional[Dict[str, str]] = None,
+    merge_gap: int = CANONICAL_MERGE_GAP,
+    pre_pad: int = CANONICAL_PRE_PAD,
+    post_pad: int = CANONICAL_POST_PAD,
+) -> Dict[str, Any]:
+    """【补充视图】Pool-Union：全部参与算法的失败 episode + GT 消失重入区间取并集（会随 tracker_set 变化，见 tracker_set_sha256）。"""
+    groups = tracker_groups or resolve_tracker_groups(sorted(tracker_seq_rows), anchor_tracker)
+    seq_details = _manifest_sequence_details(split_manifest)
+    windows: List[Dict[str, Any]] = []
+    for seq_id in split_manifest.get("sequences", []):
+        ref_rows = tracker_seq_rows.get(anchor_tracker, {}).get(seq_id)
+        if not ref_rows:
+            ref_rows = next((tracker_seq_rows[tk][seq_id] for tk in sorted(tracker_seq_rows) if seq_id in tracker_seq_rows[tk]), None)
+        if not ref_rows:
+            continue
+        seeds: List[Tuple[int, int, str]] = []
+        for tk in sorted(tracker_seq_rows):
+            seq_ana = tracker_seq_analysis.get(tk, {}).get(seq_id)
+            if seq_ana:
+                seeds.extend((int(ep["t_start"]), int(ep["t_end"]), f"failure:{tk}")
+                             for ep in seq_ana["level3_failure_episodes_summary"]["episodes"])
+        seeds.extend(_gt_absence_seed_intervals(ref_rows))
+        if not seeds:
+            continue
+        spans = _merge_seed_intervals(seeds, merge_gap)
+        windows.extend(_build_windows_for_spans(seq_id, spans, ref_rows, tracker_seq_rows, groups, anchor_tracker,
+                                                seq_details.get(seq_id, {}), pre_pad, post_pad, "PUW"))
+    return _windows_payload(
+        "pool_union_supplementary", windows, split_manifest, anchor_tracker, groups, merge_gap, pre_pad, post_pad,
+        boundary_note="全部参与算法失败 episode ∪ GT 消失重入区间（补充视图；随 tracker_set 漂移）",
+    )
+
+
+# 向后兼容：旧名称指向主口径（Subject-Anchored）
+build_canonical_challenge_windows = build_subject_anchored_windows
+
+
+# ==============================================================================
+# 划分清单解析与 Holdout 封存护栏
+# ==============================================================================
+def resolve_split_sequences(split_manifest: Dict[str, Any]) -> Tuple[List[str], set]:
+    """返回 (序列列表, 清单自身标注为 holdout 的序列集合)。兼容 discovery/holdout（sequences 字段）与 val90_full（分区字段）。"""
+    role = str(split_manifest.get("split_role", "")).lower()
+    name = str(split_manifest.get("split_name", "")).lower()
+    if "sequences" in split_manifest:
+        seqs = [str(s) for s in split_manifest.get("sequences", [])]
+        own_holdout = set(seqs) if ("holdout" in role or "holdout" in name) else set()
+        return seqs, own_holdout
+    disc = [str(s) for s in split_manifest.get("discovery_full_54", {}).get("sequences", [])]
+    hold = [str(s) for s in split_manifest.get("holdout_full_36", {}).get("sequences", [])]
+    return disc + hold, set(hold)
+
+
+def load_holdout_set_for_split(split_json_path: Path, holdout_json: Optional[Path] = None) -> Tuple[Optional[set], List[str]]:
+    """holdout 参考集合 = holdout_verification.json（显式指定或与划分清单同目录）∪ 同目录 val90_full.json 的 holdout_full_36。"""
+    hj = holdout_json if holdout_json else split_json_path.parent / "holdout_verification.json"
+    if not hj.exists():
+        return None, []
+    seqs = set(str(s) for s in json.loads(hj.read_text(encoding="utf-8")).get("sequences", []))
+    sources = [str(hj)]
+    v90 = hj.parent / "val90_full.json"
+    if v90.exists():
+        seqs |= set(str(s) for s in json.loads(v90.read_text(encoding="utf-8")).get("holdout_full_36", {}).get("sequences", []))
+        sources.append(str(v90))
+    return seqs, sources
+
+
+def apply_holdout_guard(
+    split_json_path: Path,
+    split_manifest: Dict[str, Any],
+    unlock_holdout: bool,
+    holdout_json: Optional[Path] = None,
+) -> Dict[str, Any]:
+    all_seqs, own_holdout = resolve_split_sequences(split_manifest)
+    ref_set, sources = load_holdout_set_for_split(split_json_path, holdout_json)
+    if ref_set is None and not unlock_holdout:
+        raise HoldoutSealedError(
+            f"未在 {split_json_path.parent} 找到 holdout_verification.json，无法确认划分中是否含 Holdout 序列，按封存规则拒绝执行；"
+            "请用 --holdout-json 指定，或确认需要解封时显式传入 --unlock-holdout。"
+        )
+    holdout_set = (ref_set or set()) | own_holdout
+    holdout_in_split = [s for s in all_seqs if s in holdout_set]
+    if holdout_in_split and not unlock_holdout:
+        if len(holdout_in_split) == len(all_seqs):
+            raise HoldoutSealedError(
+                f"划分 {split_manifest.get('split_name')} 全部为 Holdout 序列（{len(all_seqs)} 条），默认拒绝读取；如确需解封请显式传入 --unlock-holdout。"
+            )
+        targets = [s for s in all_seqs if s not in holdout_set]
+        excluded = holdout_in_split
+    else:
+        targets, excluded = list(all_seqs), []
+    return {
+        "unlock_holdout": bool(unlock_holdout),
+        "holdout_reference_sources": sources,
+        "holdout_reference_found": ref_set is not None,
+        "target_sequences": targets,
+        "excluded_holdout_sequences": excluded,
+        "holdout_sequences_included": [s for s in targets if s in holdout_set],
+        "holdout_unsealed": bool(unlock_holdout and any(s in holdout_set for s in targets)) or (unlock_holdout and ref_set is None),
     }
 
 
@@ -1055,55 +1294,68 @@ def load_jsonl_telemetry(jsonl_path: Path) -> List[Dict[str, Any]]:
     return rows
 
 
+
 # ==============================================================================
 # 批量目录扫描与顶层数据库构建入口
 # ==============================================================================
+SENSITIVITY_CRITERIA: Tuple[str, ...] = (
+    "tau_0.00", "tau_0.10", "tau_0.30", "tau_0.50", "nce_gt_1.0", "composite_iou0.10_or_nce1.0",
+)
+
+
+def _discover_tracker_dirs(telemetry_root: Path, split_name: str, split_stem: str, anchor_tracker: str) -> Dict[str, Path]:
+    tracker_dirs: Dict[str, Path] = {}
+    if not telemetry_root.exists():
+        return tracker_dirs
+    if list(telemetry_root.glob("*.jsonl")):
+        tracker_dirs[anchor_tracker] = telemetry_root
+        return tracker_dirs
+    own_suffixes = tuple(sorted({f"_{split_name}", f"_{split_stem}"}, key=len, reverse=True))
+    other_suffixes = ("_val90_full", "_holdout_verification", "_discovery_set")
+    for sub in sorted(telemetry_root.iterdir()):
+        if not sub.is_dir():
+            continue
+        dn = sub.name
+        own = next((s for s in own_suffixes if dn.endswith(s)), None)
+        if own:
+            tk_name = dn[: -len(own)]
+        elif any(dn.endswith(s) for s in other_suffixes):
+            continue  # 属于其他划分（含 holdout 目录）——不读取
+        else:
+            tk_name = dn
+        if list(sub.glob("*.jsonl")):
+            tracker_dirs[tk_name] = sub
+    return tracker_dirs
+
+
 def run_phase2_extraction_pipeline(
     telemetry_root: Path,
     split_json_path: Path,
     output_dir: Path,
     anchor_tracker: str = "SiamDT_Baseline",
+    unlock_holdout: bool = False,
+    holdout_json: Optional[Path] = None,
+    tracker_groups_override: Optional[Dict[str, str]] = None,
 ) -> Tuple[Path, Path]:
     """
-    扫描 telemetry_root 下所有符合 `<TrackerName>_<SplitName>`（或直接 `<TrackerName>`）的子目录，
-    对 split_json_path 指定的序列集合执行三层失败分析，输出：
+    输出（返回值仍为 (db_path, cw_path) 以兼容调用方）：
     1. FAILURE_EPISODE_DATABASE.json
-    2. CANONICAL_CHALLENGE_WINDOWS.json
+    2. CANONICAL_CHALLENGE_WINDOWS.json —— 主口径 Subject-Anchored Windows
+    3. POOL_UNION_CHALLENGE_WINDOWS.json —— 补充视图（含 tracker_set 及其 hash）
+    Holdout：默认拒绝读取；解封后输出目录改为 <output_dir>__HOLDOUT_UNSEALED，与 discovery 结果分开。
     """
     split_manifest = json.loads(split_json_path.read_text(encoding="utf-8"))
     split_name = split_manifest.get("split_name", split_json_path.stem)
-    target_sequences: List[str] = split_manifest.get("sequences", [])
-    seq_meta_map = {
-        item["seq_name"]: item
-        for item in split_manifest.get("sequence_details", [])
-        if "seq_name" in item
-    }
+    guard = apply_holdout_guard(split_json_path, split_manifest, unlock_holdout, holdout_json)
+    target_sequences: List[str] = guard["target_sequences"]
+    if guard["excluded_holdout_sequences"]:
+        print(f"[Holdout 封存] 已排除 {len(guard['excluded_holdout_sequences'])} 条 Holdout 序列（未读取其遥测）。", flush=True)
+    seq_meta_map = _manifest_sequence_details(split_manifest)
+    filtered_manifest = {"split_name": split_name, "sequences": target_sequences,
+                         "sequence_details": [seq_meta_map[s] for s in target_sequences if s in seq_meta_map]}
 
-    # 发现所有算法遥测目录
-    tracker_dirs: Dict[str, Path] = {}
-    if telemetry_root.exists():
-        # 若 telemetry_root 本身就包含 *.jsonl，则视为单算法目录
-        direct_jsonls = list(telemetry_root.glob("*.jsonl"))
-        if direct_jsonls:
-            tracker_dirs[anchor_tracker] = telemetry_root
-        else:
-            for sub in sorted(telemetry_root.iterdir()):
-                if not sub.is_dir():
-                    continue
-                # 支持形如 SiamDT_Baseline_discovery_set 或 SiamDT_Baseline
-                dir_name = sub.name
-                suffix = f"_{split_name}"
-                if dir_name.endswith(suffix):
-                    tk_name = dir_name[: -len(suffix)]
-                elif "_" in dir_name and any(
-                    dir_name.endswith(s) for s in ("_val90_full", "_holdout_verification", "_discovery_set")
-                ):
-                    # 属于其他划分的目录则跳过
-                    continue
-                else:
-                    tk_name = dir_name
-                if list(sub.glob("*.jsonl")):
-                    tracker_dirs[tk_name] = sub
+    tracker_dirs = _discover_tracker_dirs(telemetry_root, split_name, split_json_path.stem, anchor_tracker)
+    groups = resolve_tracker_groups(sorted(tracker_dirs), anchor_tracker, tracker_groups_override)
 
     tracker_seq_rows: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
     tracker_seq_analysis: Dict[str, Dict[str, Dict[str, Any]]] = {}
@@ -1112,37 +1364,12 @@ def run_phase2_extraction_pipeline(
     for tk_name, tk_dir in tracker_dirs.items():
         tracker_seq_rows[tk_name] = {}
         tracker_seq_analysis[tk_name] = {}
-
         seq_sa_list: List[float] = []
-        total_present_frames = 0
-        total_absent_frames = 0
-        total_zero_frames = 0
-        total_fail_frames = 0
-        total_imprecise_frames = 0
-        total_hq_frames = 0
-        total_absent_fp = 0
+        tot = {"present": 0, "absent": 0, "zero": 0, "fail": 0, "imprecise": 0, "hq": 0, "absent_fp": 0}
         all_episodes: List[Dict[str, Any]] = []
-
-        # 聚合级敏感性计数器
-        agg_sens = {
-            crit: {
-                "failed_present_frames": 0,
-                "eval_present_frames": 0,
-                "episode_count": 0,
-                "max_episode_duration": 0,
-                "unrecovered_terminal_episodes": 0,
-            }
-            for crit in (
-                "tau_0.00",
-                "tau_0.10",
-                "tau_0.30",
-                "tau_0.50",
-                "nce_gt_1.0",
-                "composite_iou0.10_or_nce1.0",
-            )
-        }
-
-        for seq_id in target_sequences:
+        agg_sens = {c: {"failed_present_frames": 0, "eval_present_frames": 0, "episode_count": 0,
+                        "max_episode_duration": 0, "unrecovered_terminal_episodes": 0} for c in SENSITIVITY_CRITERIA}
+        for seq_id in target_sequences:  # 只遍历已通过 holdout 护栏的序列
             jf = tk_dir / f"{seq_id}.jsonl"
             if not jf.exists():
                 continue
@@ -1152,97 +1379,77 @@ def run_phase2_extraction_pipeline(
             tracker_seq_rows[tk_name][seq_id] = rows
             seq_ana = analyze_single_sequence(rows, seq_meta_map.get(seq_id))
             tracker_seq_analysis[tk_name][seq_id] = seq_ana
-
             l1 = seq_ana["level1_sequence_metrics"]
             l2 = seq_ana["level2_frame_and_absence_analysis"]
             l3 = seq_ana["level3_failure_episodes_summary"]
-
             seq_sa_list.append(float(l1["sa_score"]))
-            total_present_frames += int(l1["present_valid_frames"])
-            total_absent_frames += int(l1["absent_frames"])
+            tot["present"] += int(l1["present_valid_frames"])
+            tot["absent"] += int(l1["absent_frames"])
             sc = l2["present_frame_state_counts"]
-            total_zero_frames += int(sc["ZERO_OVERLAP_LOST"])
-            total_fail_frames += int(sc["FAILURE_FRAME"])
-            total_imprecise_frames += int(sc["IMPRECISE_LOCALIZATION"])
-            total_hq_frames += int(sc["HIGH_QUALITY_LOCK"])
-            total_absent_fp += int(l2["absence_and_reacquisition"]["false_positive_in_absent_frames"])
+            tot["zero"] += int(sc["ZERO_OVERLAP_LOST"])
+            tot["fail"] += int(sc["FAILURE_FRAME"])
+            tot["imprecise"] += int(sc["IMPRECISE_LOCALIZATION"])
+            tot["hq"] += int(sc["HIGH_QUALITY_LOCK"])
+            tot["absent_fp"] += int(l2["absence_and_reacquisition"]["false_positive_in_absent_frames"])
             all_episodes.extend(l3["episodes"])
-
             eval_p_cnt = max(0, int(l1["present_valid_frames"]) - 1)
             for crit, cdict in l2["sensitivity_analysis"].items():
                 agg_sens[crit]["failed_present_frames"] += int(cdict["failed_present_frames"])
                 agg_sens[crit]["eval_present_frames"] += eval_p_cnt
                 agg_sens[crit]["episode_count"] += int(cdict["episode_count"])
-                agg_sens[crit]["max_episode_duration"] = max(
-                    agg_sens[crit]["max_episode_duration"], int(cdict["max_episode_duration"])
-                )
+                agg_sens[crit]["max_episode_duration"] = max(agg_sens[crit]["max_episode_duration"], int(cdict["max_episode_duration"]))
                 agg_sens[crit]["unrecovered_terminal_episodes"] += int(cdict["unrecovered_terminal_episodes"])
 
-        # 汇总算法级指标
         ep_durations = [int(e["present_duration_frames"]) for e in all_episodes]
-        bucket_totals = {
-            "Bucket_1_5_Transient": sum(1 for e in all_episodes if e["duration_bucket"] == "Bucket_1_5_Transient"),
-            "Bucket_6_20_Short": sum(1 for e in all_episodes if e["duration_bucket"] == "Bucket_6_20_Short"),
-            "Bucket_21_100_Medium": sum(1 for e in all_episodes if e["duration_bucket"] == "Bucket_21_100_Medium"),
-            "Bucket_101_Plus_Long_Drift": sum(
-                1 for e in all_episodes if e["duration_bucket"] == "Bucket_101_Plus_Long_Drift"
-            ),
-        }
-
-        sensitivity_summary = {}
-        for crit, ctot in agg_sens.items():
-            ep_cnt = ctot["eval_present_frames"]
-            sensitivity_summary[crit] = {
-                "failed_present_frames": ctot["failed_present_frames"],
-                "failure_frame_rate": round(ctot["failed_present_frames"] / ep_cnt, 6) if ep_cnt > 0 else 0.0,
-                "total_episodes": ctot["episode_count"],
-                "max_episode_duration": ctot["max_episode_duration"],
-                "unrecovered_terminal_episodes": ctot["unrecovered_terminal_episodes"],
-            }
-
+        buckets = ("Bucket_1_5_Transient", "Bucket_6_20_Short", "Bucket_21_100_Medium", "Bucket_101_Plus_Long_Drift")
+        rate = lambda a, b: round(a / b, 6) if b > 0 else 0.0  # noqa: E731
         tracker_aggregates[tk_name] = {
             "tracker_name": tk_name,
+            "tracker_group": groups.get(tk_name, GROUP_UNASSIGNED),
             "telemetry_source_dir": str(tk_dir),
             "evaluated_sequences_count": len(seq_sa_list),
             "target_sequences_count": len(target_sequences),
             "macro_mean_sa": round(sum(seq_sa_list) / len(seq_sa_list), 6) if seq_sa_list else 0.0,
-            "total_present_frames": total_present_frames,
-            "total_absent_frames": total_absent_frames,
-            "overall_zero_overlap_rate": (
-                round(total_zero_frames / total_present_frames, 6) if total_present_frames > 0 else 0.0
-            ),
-            "overall_primary_failure_rate_tau010": (
-                round(total_fail_frames / total_present_frames, 6) if total_present_frames > 0 else 0.0
-            ),
-            "overall_imprecise_rate": (
-                round(total_imprecise_frames / total_present_frames, 6) if total_present_frames > 0 else 0.0
-            ),
-            "overall_high_quality_rate": (
-                round(total_hq_frames / total_present_frames, 6) if total_present_frames > 0 else 0.0
-            ),
-            "overall_absent_false_positive_rate": (
-                round(total_absent_fp / total_absent_frames, 6) if total_absent_frames > 0 else 0.0
-            ),
+            "total_present_frames": tot["present"],
+            "total_absent_frames": tot["absent"],
+            "overall_zero_overlap_rate": rate(tot["zero"], tot["present"]),
+            "overall_primary_failure_rate_tau010": rate(tot["fail"], tot["present"]),
+            "overall_imprecise_rate": rate(tot["imprecise"], tot["present"]),
+            "overall_high_quality_rate": rate(tot["hq"], tot["present"]),
+            "overall_absent_false_positive_rate": rate(tot["absent_fp"], tot["absent"]),
             "total_failure_episodes": len(all_episodes),
             "total_episode_present_frames": sum(ep_durations),
             "mean_episode_duration_frames": round(sum(ep_durations) / len(ep_durations), 3) if ep_durations else 0.0,
             "max_episode_duration_frames": max(ep_durations) if ep_durations else 0,
             "recovered_episodes_count": sum(1 for e in all_episodes if e["recovery_status"] == "recovered"),
-            "unrecovered_terminal_drift_count": sum(
-                1 for e in all_episodes if e["recovery_status"] == "unrecovered_terminal_drift"
-            ),
-            "episode_duration_buckets": bucket_totals,
-            "sensitivity_analysis_summary": sensitivity_summary,
+            "unrecovered_terminal_drift_count": sum(1 for e in all_episodes if e["recovery_status"] == "unrecovered_terminal_drift"),
+            "episode_duration_buckets": {b: sum(1 for e in all_episodes if e["duration_bucket"] == b) for b in buckets},
+            "sensitivity_analysis_summary": {
+                crit: {
+                    "failed_present_frames": c["failed_present_frames"],
+                    "failure_frame_rate": rate(c["failed_present_frames"], c["eval_present_frames"]),
+                    "total_episodes": c["episode_count"],
+                    "max_episode_duration": c["max_episode_duration"],
+                    "unrecovered_terminal_episodes": c["unrecovered_terminal_episodes"],
+                } for crit, c in agg_sens.items()
+            },
             "per_sequence_analysis": tracker_seq_analysis[tk_name],
         }
 
-    # 构建 FAILURE_EPISODE_DATABASE.json
+    if guard["holdout_unsealed"]:
+        output_dir = output_dir.with_name(output_dir.name + "__HOLDOUT_UNSEALED")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    fp = tracker_set_fingerprint(groups)
     failure_db_payload = {
-        "schema_version": "1.0.0",
-        "protocol_version": "v1.0-phase2-protocol-frozen",
+        "schema_version": "1.1.0",
+        "protocol_version": PROTOCOL_VERSION,
         "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "split_name": split_name,
         "split_manifest_path": str(split_json_path),
+        "holdout_guard": guard,
+        "tracker_groups": groups,
+        **fp,
         "frozen_protocol_parameters": {
             "primary_tau_fail": PRIMARY_TAU_FAIL,
             "imprecise_localization_band": [PRIMARY_TAU_FAIL, IMPRECISE_UPPER_IOU],
@@ -1257,147 +1464,233 @@ def run_phase2_extraction_pipeline(
         "evaluated_trackers_count": len(tracker_aggregates),
         "trackers": tracker_aggregates,
     }
+    subject_payload = build_subject_anchored_windows(tracker_seq_rows, tracker_seq_analysis, filtered_manifest, anchor_tracker, groups)
+    pool_payload = build_pool_union_challenge_windows(tracker_seq_rows, tracker_seq_analysis, filtered_manifest, anchor_tracker, groups)
+    for p in (subject_payload, pool_payload):
+        p["holdout_guard"] = {k: guard[k] for k in ("unlock_holdout", "excluded_holdout_sequences", "holdout_sequences_included", "holdout_unsealed")}
 
-    # 构建 CANONICAL_CHALLENGE_WINDOWS.json
-    canonical_windows_payload = build_canonical_challenge_windows(
-        tracker_seq_rows=tracker_seq_rows,
-        tracker_seq_analysis=tracker_seq_analysis,
-        split_manifest=split_manifest,
-        anchor_tracker=anchor_tracker,
-    )
-
-    output_dir.mkdir(parents=True, exist_ok=True)
     db_path = output_dir / "FAILURE_EPISODE_DATABASE.json"
     cw_path = output_dir / "CANONICAL_CHALLENGE_WINDOWS.json"
-
+    pu_path = output_dir / "POOL_UNION_CHALLENGE_WINDOWS.json"
     db_path.write_text(json.dumps(failure_db_payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    cw_path.write_text(json.dumps(canonical_windows_payload, indent=2, ensure_ascii=False), encoding="utf-8")
-
+    cw_path.write_text(json.dumps(subject_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    pu_path.write_text(json.dumps(pool_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    if guard["holdout_unsealed"]:
+        (output_dir / "HOLDOUT_UNSEAL_RECORD.json").write_text(json.dumps({
+            "unsealed_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "split_manifest_path": str(split_json_path),
+            "holdout_sequences_included": guard["holdout_sequences_included"],
+            "note": "Holdout 结果已解封；严禁据此反向调整阈值或超参数（协议 1.1-3）。",
+        }, indent=2, ensure_ascii=False), encoding="utf-8")
     return db_path, cw_path
 
 
 # ==============================================================================
 # 内置自检单元测试 (--self-test)
 # ==============================================================================
-def _run_self_test() -> None:
-    """
-    构造合成多算法遥测数据并验证：
-    1. 瞬时波动桥接 (<= 3 帧非失败间隙自动合并)；
-    2. 消失期 false_positive_in_absent 与重入连续 5 帧 IoU>=0.50 的 Re-acquisition Latency；
-    3. 敏感性阈值集合 {0.0, 0.10, 0.30, 0.50} 与 NCE > 1.0；
-    4. 跨算法 Canonical Challenge Windows 对齐与 Type B (Rescue) 判定。
-    """
+def _make_synthetic_sequence() -> Tuple[str, List[List[float]], List[int]]:
     seq_id = "03_7951_1500-2999"
     total_f = 80
     gt_rects = [[100.0 + f * 1.0, 100.0, 20.0, 20.0] for f in range(total_f)]
     exist_flags = [1] * total_f
-    # 设定第 40..44 帧 (5帧) 目标消失 (exist == 0)
     for t in range(40, 45):
         exist_flags[t] = 0
         gt_rects[t] = [0.0, 0.0, 0.0, 0.0]
+    return seq_id, gt_rects, exist_flags
 
-    # 算法 A (SiamDT_Baseline):
-    # - 第 15..18 帧失败 (IoU=0)，第 19..20 帧瞬时擦边 (IoU=0.25, 2帧 <= 3帧桥接)，第 21..25 帧失败 (IoU=0)
-    #   -> 应桥接为单个 Failure Episode [15, 25]，并在第 26..30 帧连续 5 帧 IoU=1.0 实现 recovered (latency=0)
-    # - 第 40..44 帧消失期间继续输出实框 (false_positive_in_absent = 5)
-    # - 第 45 帧重入后，第 45..47 帧丢失 (3帧)，第 48..52 帧恢复锁定 -> Re-acquisition Latency = 3 帧
+
+def _run_self_test() -> None:
+    report: Dict[str, Any] = {}
+    seq_id, gt_rects, exist_flags = _make_synthetic_sequence()
+    total_f = len(gt_rects)
+
+    # ---------------- 1. 桥接 / 重入延迟（v1.0 原有用例，保持不变） ----------------
     pred_siamdt = [list(gt_rects[f]) if exist_flags[f] == 1 else [150.0, 150.0, 20.0, 20.0] for f in range(total_f)]
-    for t in range(15, 19):
+    for t in list(range(15, 19)) + list(range(21, 26)) + list(range(45, 48)):
         pred_siamdt[t] = [10.0, 10.0, 20.0, 20.0]
     for t in range(19, 21):
-        # 构造 IoU ~ 0.25 (位移 12px)
         pred_siamdt[t] = [gt_rects[t][0] + 12.0, gt_rects[t][1], 20.0, 20.0]
-    for t in range(21, 26):
-        pred_siamdt[t] = [10.0, 10.0, 20.0, 20.0]
-    for t in range(45, 48):
-        pred_siamdt[t] = [10.0, 10.0, 20.0, 20.0]
-
-    rows_siamdt = build_telemetry_rows_from_boxes(seq_id, pred_siamdt, gt_rects, exist_flags)
-    ana_siamdt = analyze_single_sequence(rows_siamdt)
-
-    eps = ana_siamdt["level3_failure_episodes_summary"]["episodes"]
-    assert len(eps) == 2, f"期望 2 个桥接后失败事件段，实际得到 {len(eps)}"
-    assert eps[0]["t_start"] == 15 and eps[0]["t_end"] == 25, f"桥接边界错误: {eps[0]}"
-    assert eps[0]["bridged_transient_frames_count"] == 2, f"桥接帧数错误: {eps[0]}"
+    rows_s = build_telemetry_rows_from_boxes(seq_id, pred_siamdt, gt_rects, exist_flags)
+    ana_s = analyze_single_sequence(rows_s)
+    eps = ana_s["level3_failure_episodes_summary"]["episodes"]
+    assert len(eps) == 2, f"期望 2 个桥接后失败事件段，实际 {len(eps)}"
+    assert eps[0]["t_start"] == 15 and eps[0]["t_end"] == 25 and eps[0]["bridged_transient_frames_count"] == 2
     assert eps[0]["recovery_status"] == "recovered" and eps[0]["recovery_latency_frames"] == 0
-
-    reacq = ana_siamdt["level2_frame_and_absence_analysis"]["absence_and_reacquisition"]
+    reacq = ana_s["level2_frame_and_absence_analysis"]["absence_and_reacquisition"]
     assert reacq["false_positive_in_absent_frames"] == 5
-    assert reacq["events"][0]["reacquired"] is True
-    assert reacq["events"][0]["reacquisition_latency_frames"] == 3, f"重捕获延迟错误: {reacq['events'][0]}"
+    assert reacq["events"][0]["reacquired"] is True and reacq["events"][0]["reacquisition_latency_frames"] == 3
+    report["1_bridging_and_reacquisition"] = {"episode_0": [eps[0]["t_start"], eps[0]["t_end"]], "reacq_latency": 3, "pass": True}
 
-    # 算法 B (FocusTrack): 在 [15, 25] 保持完美跟踪 -> 应在 Canonical Challenge Window 中触发 Type_B / Type_C Rescue
+    # 对手：FocusTrack（同域）全程完美；DAM4SAM（零样本）在 [15,25] 与 [60,70] 失败（后者 SiamDT 正常）
     pred_focus = [list(gt_rects[f]) if exist_flags[f] == 1 else [0.0, 0.0, 0.0, 0.0] for f in range(total_f)]
-    rows_focus = build_telemetry_rows_from_boxes(seq_id, pred_focus, gt_rects, exist_flags)
-    ana_focus = analyze_single_sequence(rows_focus)
+    pred_dam = [list(gt_rects[f]) if exist_flags[f] == 1 else [0.0, 0.0, 0.0, 0.0] for f in range(total_f)]
+    for t in list(range(15, 26)) + list(range(60, 71)):
+        pred_dam[t] = [300.0, 300.0, 20.0, 20.0]
+    rows_f = build_telemetry_rows_from_boxes(seq_id, pred_focus, gt_rects, exist_flags)
+    rows_d = build_telemetry_rows_from_boxes(seq_id, pred_dam, gt_rects, exist_flags)
+    manifest = {"split_name": "self_test", "sequences": [seq_id], "sequence_details": [{"seq_name": seq_id}]}
+    rows2 = {"SiamDT_Baseline": {seq_id: rows_s}, "FocusTrack": {seq_id: rows_f}}
+    ana2 = {"SiamDT_Baseline": {seq_id: ana_s}, "FocusTrack": {seq_id: analyze_single_sequence(rows_f)}}
+    rows3 = {**rows2, "DAM4SAM": {seq_id: rows_d}}
+    ana3 = {**ana2, "DAM4SAM": {seq_id: analyze_single_sequence(rows_d)}}
 
-    cw = build_canonical_challenge_windows(
-        tracker_seq_rows={"SiamDT_Baseline": {seq_id: rows_siamdt}, "FocusTrack": {seq_id: rows_focus}},
-        tracker_seq_analysis={"SiamDT_Baseline": {seq_id: ana_siamdt}, "FocusTrack": {seq_id: ana_focus}},
-        split_manifest={"split_name": "self_test", "sequences": [seq_id], "sequence_details": [{"seq_name": seq_id}]},
-        anchor_tracker="SiamDT_Baseline",
-    )
-    assert cw["summary"]["total_canonical_windows"] == 2
-    w0 = cw["canonical_windows"][0]
-    assert "FocusTrack" in w0["rescuing_trackers"], f"期望 FocusTrack 成功 Rescue 窗口 0: {w0}"
-    print(json.dumps({
-        "self_test": "PASS",
-        "verified_episode_bridging": [eps[0]["t_start"], eps[0]["t_end"]],
-        "verified_reacquisition_latency": reacq["events"][0]["reacquisition_latency_frames"],
-        "verified_canonical_windows_count": cw["summary"]["total_canonical_windows"],
-        "verified_window_0_rescuer": w0["best_rescuer"],
-    }, ensure_ascii=False, indent=2))
+    # ---------------- 2. Subject-Anchored 窗口不随新增算法变化 ----------------
+    sa2 = build_subject_anchored_windows(rows2, ana2, manifest)
+    sa3 = build_subject_anchored_windows(rows3, ana3, manifest)
+    sig = lambda p: [(w["window_id"], w["core_challenge_span"], w["padded_context_span"]) for w in p["windows"]]  # noqa: E731
+    assert sig(sa2) == sig(sa3), f"Subject-anchored 窗口随算法集合漂移: {sig(sa2)} vs {sig(sa3)}"
+    assert sa2["window_set_sha256"] == sa3["window_set_sha256"]
+    assert sa2["tracker_set_sha256"] != sa3["tracker_set_sha256"]
+    pu2 = build_pool_union_challenge_windows(rows2, ana2, manifest)
+    pu3 = build_pool_union_challenge_windows(rows3, ana3, manifest)
+    assert pu3["window_set_sha256"] != pu2["window_set_sha256"], "补充视图应体现 tracker_set 引起的窗口漂移"
+    pu_sig = lambda p: [w["core_challenge_span"] for w in p["windows"]]  # noqa: E731
+    report["2_subject_anchored_invariance"] = {
+        "subject_windows_2_trackers": [list(map(str, s)) for s in sig(sa2)],
+        "subject_windows_3_trackers": [list(map(str, s)) for s in sig(sa3)],
+        "window_set_sha256_equal": True,
+        "tracker_set_sha256_differs": True,
+        "pool_union_core_spans_2_vs_3_trackers (补充视图随算法集合漂移)": [pu_sig(pu2), pu_sig(pu3)],
+        "pass": True,
+    }
+
+    # ---------------- 3. 分轨分类 ----------------
+    w0 = sa3["windows"][0]
+    assert w0["core_challenge_span"] == [15, 25]
+    assert w0["window_diagnostic_type"] == "Type_C_SiamDT_Unique_Failure", w0["window_diagnostic_type"]
+    assert w0["in_domain_peer_survival_rate"] == 1.0 and w0["zero_shot_peer_survival_rate"] == 0.0
+    assert w0["best_peer"]["tracker"] == "FocusTrack"
+    g = {"SiamDT_Baseline": GROUP_SUBJECT, "FocusTrack": GROUP_IN_DOMAIN, "MemLoTrack": GROUP_IN_DOMAIN, "DAM4SAM": GROUP_ZERO_SHOT}
+
+    def _o(status: str, sa: float = 0.5) -> Dict[str, Any]:
+        return {"status": status, "window_mean_sa": sa}
+
+    cases = {
+        "B_zero_shot_rescue": ({"SiamDT_Baseline": _o("FAILED_UNRECOVERED"), "FocusTrack": _o("FAILED_UNRECOVERED"), "DAM4SAM": _o("SUCCESS", 0.9)},
+                               "Type_B_Rescued_SiamDT_Failure", ["zero_shot"]),
+        "A_all_failed": ({"SiamDT_Baseline": _o("FAILED_UNRECOVERED"), "FocusTrack": _o("FAILED_UNRECOVERED"), "DAM4SAM": _o("FAILED_UNRECOVERED")},
+                         "Type_A_Common_Hard_Failure", []),
+        "U_no_peers": ({"SiamDT_Baseline": _o("FAILED_UNRECOVERED")}, "Type_U_No_Peer_Evidence", []),
+        "D_in_domain_failed": ({"SiamDT_Baseline": _o("SUCCESS"), "FocusTrack": _o("FAILED_UNRECOVERED"), "DAM4SAM": _o("SUCCESS")},
+                               "Type_D_InDomain_Peer_Failure_SiamDT_Success", []),
+        "D0_zero_shot_only_failed": ({"SiamDT_Baseline": _o("ROBUST_SURVIVAL"), "FocusTrack": _o("SUCCESS"), "DAM4SAM": _o("FAILED_UNRECOVERED")},
+                                     "Type_D0_ZeroShot_Only_Peer_Failure_SiamDT_Success", []),
+        "B_in_domain_half_not_majority": ({"SiamDT_Baseline": _o("FAILED_UNRECOVERED"), "FocusTrack": _o("SUCCESS"), "MemLoTrack": _o("FAILED_UNRECOVERED"),
+                                           "DAM4SAM": _o("FAILED_UNRECOVERED")}, "Type_B_Rescued_SiamDT_Failure", ["in_domain"]),
+        "C_despite_zero_shot_mass_failure": ({"SiamDT_Baseline": _o("TRANSIENT_FAILURE_RECOVERED"), "FocusTrack": _o("SUCCESS"), "MemLoTrack": _o("ROBUST_SURVIVAL"),
+                                              "DAM4SAM": _o("FAILED_UNRECOVERED")}, "Type_C_SiamDT_Unique_Failure", ["in_domain"]),
+        "X_subject_missing": ({"FocusTrack": _o("SUCCESS")}, "Type_X_Subject_Not_Evaluated", []),
+    }
+    case_out = {}
+    for name, (outs, expect, exp_tracks) in cases.items():
+        res = classify_window_type(outs.get("SiamDT_Baseline"), outs, {k: v for k, v in g.items() if k in outs})
+        assert res["window_diagnostic_type"] == expect, f"{name}: {res['window_diagnostic_type']} != {expect}"
+        assert res["rescue_tracks"] == exp_tracks, f"{name}: rescue_tracks {res['rescue_tracks']} != {exp_tracks}"
+        case_out[name] = res["window_diagnostic_type"]
+    assert resolve_tracker_groups(["SiamDT_Baseline", "UTPTrack-S", "MemLoTrack_scratch", "AiATrack"], "SiamDT_Baseline") == {
+        "SiamDT_Baseline": GROUP_SUBJECT, "UTPTrack-S": GROUP_ZERO_SHOT, "MemLoTrack_scratch": GROUP_IN_DOMAIN, "AiATrack": GROUP_UNASSIGNED}
+    report["3_track_separated_classification"] = {
+        "end_to_end_window_0": {"type": w0["window_diagnostic_type"], "in_domain_survival": w0["in_domain_peer_survival_rate"],
+                                "zero_shot_survival": w0["zero_shot_peer_survival_rate"], "best_peer": w0["best_peer"]["tracker"],
+                                "note": "v1.0 规则（全体对手 >=80% 存活）下此窗口会被判为 Type_B；分轨后正确判为 Type_C"},
+        "unit_cases": case_out,
+        "unassigned_tracker_kept_out_of_tracks": "AiATrack -> unassigned",
+        "pass": True,
+    }
+
+    # ---------------- 4. Holdout 默认拒绝 ----------------
+    with tempfile.TemporaryDirectory(prefix="phase2_selftest_") as td:
+        tdp = Path(td)
+        splits = tdp / "splits"
+        splits.mkdir()
+        (splits / "holdout_verification.json").write_text(json.dumps(
+            {"split_name": "holdout_verification", "split_role": "holdout_verification", "sequences": ["HOLD_SEQ"]}), encoding="utf-8")
+        (splits / "mixed_val.json").write_text(json.dumps(
+            {"split_name": "mixed_val", "discovery_full_54": {"sequences": ["DISC_SEQ"]}, "holdout_full_36": {"sequences": ["HOLD_SEQ"]}}), encoding="utf-8")
+        tele = tdp / "telemetry" / "SiamDT_Baseline"
+        tele.mkdir(parents=True)
+        disc_rows = build_telemetry_rows_from_boxes("DISC_SEQ", pred_siamdt, gt_rects, exist_flags)
+        (tele / "DISC_SEQ.jsonl").write_text("\n".join(json.dumps(r) for r in disc_rows) + "\n", encoding="utf-8")
+        (tele / "HOLD_SEQ.jsonl").write_text("THIS FILE MUST NEVER BE READ UNLESS UNLOCKED\n", encoding="utf-8")
+        out = tdp / "out" / "reports"
+
+        refused_pure = False
+        try:
+            run_phase2_extraction_pipeline(tdp / "telemetry", splits / "holdout_verification.json", out)
+        except HoldoutSealedError:
+            refused_pure = True
+        assert refused_pure, "纯 holdout 划分应被默认拒绝"
+
+        db_p, cw_p = run_phase2_extraction_pipeline(tdp / "telemetry", splits / "mixed_val.json", out)
+        db = json.loads(db_p.read_text(encoding="utf-8"))
+        assert db["holdout_guard"]["excluded_holdout_sequences"] == ["HOLD_SEQ"]
+        assert list(db["trackers"]["SiamDT_Baseline"]["per_sequence_analysis"].keys()) == ["DISC_SEQ"]
+        assert db_p.parent == out, "未解封时应写入 discovery 输出目录"
+        assert (out / "POOL_UNION_CHALLENGE_WINDOWS.json").exists()
+
+        lonely = tdp / "lonely"
+        lonely.mkdir()
+        (lonely / "discovery_set.json").write_text(json.dumps({"split_name": "discovery_set", "sequences": ["DISC_SEQ"]}), encoding="utf-8")
+        refused_missing = False
+        try:
+            run_phase2_extraction_pipeline(tdp / "telemetry", lonely / "discovery_set.json", out)
+        except HoldoutSealedError:
+            refused_missing = True
+        assert refused_missing, "找不到 holdout 清单时应 fail-closed"
+
+        tele2 = tdp / "telemetry_unlock" / "SiamDT_Baseline"
+        tele2.mkdir(parents=True)
+        (tele2 / "HOLD_SEQ.jsonl").write_text("\n".join(json.dumps({**r, "seq_id": "HOLD_SEQ"}) for r in disc_rows) + "\n", encoding="utf-8")
+        db_u, _ = run_phase2_extraction_pipeline(tdp / "telemetry_unlock", splits / "holdout_verification.json", out, unlock_holdout=True)
+        assert db_u.parent.name == "reports__HOLDOUT_UNSEALED", db_u.parent
+        assert (db_u.parent / "HOLDOUT_UNSEAL_RECORD.json").exists()
+        report["4_holdout_guard"] = {
+            "pure_holdout_split_refused_by_default": True,
+            "mixed_split_holdout_excluded_and_file_not_read": True,
+            "fail_closed_when_holdout_manifest_missing": True,
+            "unlock_writes_to_separate_dir": db_u.parent.name,
+            "pass": True,
+        }
+
+    print(json.dumps({"self_test": "PASS", "protocol_version": PROTOCOL_VERSION, **report}, ensure_ascii=False, indent=2))
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Phase 2 三层失败提取器与跨算法统一挑战时间窗生成工具"
-    )
-    parser.add_argument(
-        "--telemetry-root",
-        type=Path,
-        default=Path("G:/我的云端硬盘/SiamDT_Project/experiments/failure_diagnosis/per_frame_telemetry"),
-        help="包含各算法逐帧遥测子目录 (<Tracker>_<Split>/<seq_id>.jsonl) 的根目录",
-    )
-    parser.add_argument(
-        "--split-json",
-        type=Path,
-        default=Path("Z:/SimDT围点打援/datasets/diagnostic_splits/discovery_set.json"),
-        help="冻结的数据集划分清单 JSON 路径 (如 discovery_set.json / holdout_verification.json)",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("Z:/SimDT围点打援/phase2_unified_eval/outputs"),
-        help="输出 FAILURE_EPISODE_DATABASE.json 与 CANONICAL_CHALLENGE_WINDOWS.json 的目录",
-    )
-    parser.add_argument(
-        "--anchor-tracker",
-        type=str,
-        default="SiamDT_Baseline",
-        help="用于判定 Type A/B/C/D 救援关系的主锚点算法名称",
-    )
-    parser.add_argument(
-        "--self-test",
-        action="store_true",
-        help="运行内置确定性单元测试以核验桥接、重入延迟与 Canonical Window 逻辑",
-    )
+    parser = argparse.ArgumentParser(description="Phase 2 三层失败提取器（主口径 Subject-Anchored Windows，分轨存活率，Holdout 封存）")
+    parser.add_argument("--telemetry-root", type=Path,
+                        default=Path("G:/我的云端硬盘/SiamDT_Project/experiments/failure_diagnosis/per_frame_telemetry"),
+                        help="包含各算法逐帧遥测子目录 (<Tracker>_<Split>/<seq_id>.jsonl) 的根目录")
+    parser.add_argument("--split-json", type=Path,
+                        default=Path("Z:/SimDT围点打援/datasets/diagnostic_splits/discovery_set.json"),
+                        help="冻结划分清单（discovery_set.json / val90_full.json；holdout 需 --unlock-holdout）")
+    parser.add_argument("--output-dir", type=Path, default=Path("Z:/SimDT围点打援/phase2_unified_eval/outputs"),
+                        help="输出目录（解封 holdout 时自动改为 <output-dir>__HOLDOUT_UNSEALED）")
+    parser.add_argument("--anchor-tracker", type=str, default="SiamDT_Baseline", help="主体算法（窗口锚点）")
+    parser.add_argument("--tracker-groups", type=Path, default=None,
+                        help="可选 JSON：{tracker: group}，group ∈ group1_in_domain / group2_zero_shot / unassigned（覆盖内置前缀注册表）")
+    parser.add_argument("--holdout-json", type=Path, default=None, help="holdout_verification.json 路径（默认取划分清单同目录）")
+    parser.add_argument("--unlock-holdout", action="store_true", help="显式解封 Holdout 序列（结果写入独立目录并留下解封记录）")
+    parser.add_argument("--self-test", action="store_true", help="运行内置确定性自检")
     args = parser.parse_args()
 
     if args.self_test:
         _run_self_test()
         return
-
-    db_path, cw_path = run_phase2_extraction_pipeline(
-        telemetry_root=args.telemetry_root,
-        split_json_path=args.split_json,
-        output_dir=args.output_dir,
-        anchor_tracker=args.anchor_tracker,
-    )
+    overrides = json.loads(args.tracker_groups.read_text(encoding="utf-8")) if args.tracker_groups else None
+    try:
+        db_path, cw_path = run_phase2_extraction_pipeline(
+            telemetry_root=args.telemetry_root, split_json_path=args.split_json, output_dir=args.output_dir,
+            anchor_tracker=args.anchor_tracker, unlock_holdout=args.unlock_holdout,
+            holdout_json=args.holdout_json, tracker_groups_override=overrides,
+        )
+    except HoldoutSealedError as exc:
+        print(f"[Holdout 封存] {exc}", file=sys.stderr)
+        sys.exit(3)
     print(json.dumps({
         "status": "COMPLETED",
         "failure_episode_database": str(db_path),
-        "canonical_challenge_windows": str(cw_path),
+        "canonical_challenge_windows_subject_anchored": str(cw_path),
+        "pool_union_challenge_windows_supplementary": str(cw_path.parent / "POOL_UNION_CHALLENGE_WINDOWS.json"),
     }, ensure_ascii=False, indent=2))
 
 

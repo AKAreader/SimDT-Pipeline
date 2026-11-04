@@ -1,45 +1,60 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SiamDT 六层模块特征分层可视化与量化解剖器 (siamdt_6layer_feature_probe.py)
+SiamDT 六层模块特征解剖器 (siamdt_6layer_feature_probe.py) —— v2.0（2026-11-04 交叉审查修订版）
 ================================================================================
-针对跑分不佳或发生跟踪失败的序列，通过非侵入式 PyTorch `register_forward_hook`
-对原始 `SiamDT` (`SiamDTRCNN`) 的 6 层核心功能节点进行逐层特征提取、量化体检与全景可视化：
+本版本依据 Claude × Gemini 交叉审查（review-think-20261104-001，P0-1 / P0-2）全面重写：
+- 删除 v1 中自定义的"二阶 Gram 矩阵响应图"（SiamDT 源码 similarity_encoders.py 中不存在该机制）；
+- 删除 v1 Layer 5 中按排名递减 4%、按奇偶分配分支、统一减全局 penalty 等编造公式；
+- Layer 5 / Layer 6 全部改为从 SiamDTRCNN 真实计算路径中捕获的值，拿不到的字段写 null，绝不估算。
 
-- Layer 1 (`Backbone Stages 1~4`):
-  Swin-Tiny 四个 Stage (`C2, C3, C4, C5`, strides `4, 8, 16, 32`) 的输出特征激活图（L2 范数空间能量分布）；
-- Layer 2 (`5-Level FPN P2~P6`):
-  FPN 五个尺度（`P2, P3, P4, P5, P6`, strides `4, 8, 16, 32, 64`）各自的特征图
-  （诊断极小目标在哪一层下采样后丢失或被热背景淹没）；
-- Layer 3 (`Dual-Semantic RPN Response`):
-  `DS-RPN` 的一阶互相关匹配响应图（Cross-Correlation Map）与二阶格拉姆矩阵响应图（Gram Matrix Map）；
-- Layer 4 (`RPN Top-64 Proposals`):
-  RPN 生成的前 64 个候选框在原图上的空间分布热力与最大交并比 `max IoU_RPN`
-  （诊断是不是第一阶段 RPN 就漏检了）；
-- Layer 5 (`Versatile R-CNN Top-5 Competition`):
-  决赛圈 Top-5 候选框在原图上的位置、各自置信度得分与真实 IoU 对比条形图
-  （诊断是不是“真目标排第 2/第 3，背景干扰物排第 1”的排序倒挂）；
-- Layer 6 (`Dynamic Template & 11-way Ensemble BG Suppression`):
-  当前存储在内存中的动态模板特征 `z_dyn_feat` (`1x256x7x7`) 可视化 +
-  11 路背景抑制 (`11x256x7x7`) 前后的激活对比 + 是否发生错误模板更新（`template_updated == True` when `IoU < 0.3`）。
+科研诚信约定（每个输出字段都带 provenance 标签，见 FIELD_PROVENANCE）：
+- `captured_model_path`        : 模型真实计算路径中的量（forward hook / 方法包装直接捕获）；
+- `recomputed_by_source_formula`: 用真实捕获量按源码同一公式复算，仅用于一致性核对；
+- `posthoc_derived_not_model_path`: 事后派生量（如通道 L2 范数图、与 GT 的 IoU、T/BG 比值），非模型路径；
+- `analyst_heuristic_label`    : 分析者启发式标签（阈值由分析者设定，非模型行为）。
 
-输出产物：
-1. 高清 6 层模块全景解剖大图：`6layer_anatomy_{seq_id}_frame_{frame_id:04d}.png`
-2. 逐层量化体检指标 JSON：`6layer_metrics_{seq_id}.json`
-   （含每一层的 `target_to_bg_activation_ratio`、`target_vs_strongest_distractor_margin`、
-    `response_entropy`、`rpn_recall_iou`、`rcnn_rank_of_best_iou_proposal` 及根因归因结论）。
+六层与真实源码路径的对应关系（源码：trackers/SiamDT/trackers/siamdt_rcnn.py、similarity_encoders.py、siamdt_tracking.py）：
+- Layer 1 `model.backbone`：Swin-Tiny 4 个 Stage 输出（out_indices=(0,1,2,3)）；
+- Layer 2 `model.neck`：FPN 5 层输出（num_outs=5）；
+- Layer 3A `model.rpn_similarity_learning.proj_out[k]`：RPN_Similarity_Learning 的调制响应
+  x_corr[k] = proj_out[k](proj_query[k](template) * x[k])（similarity_encoders.py:30-32），
+  该响应在 _process_gallary:437-441 中与 x[k] 相加后送入 RPN；
+  注意 forward 是 generator，本工具只在 proj_out 子模块上挂 hook，绝不消费 generator；
+- Layer 3B `model.rcnn_similarity_learning.proj_out`：Stage-2 RCNN_Similarity_Learning 的响应
+  proj_out(proj_x(x) * proj_z(z))（similarity_encoders.py:53），按调用阶段区分
+  `rcnn_main`（simple_test_bboxes:203，模板 vs 全部 RPN 候选）与 `bg_matching`（simple_matching:276，候选 vs 背景记忆）；
+- Layer 4 RPN 候选：simple_test_bboxes 的 proposals 入参（网络输入尺度）→ 除以 img_meta['scale_factor'] 还原原图；
+- Layer 5 决赛圈：源码 _process_gallary:452-460 把 tra_bboxes 与 det_bboxes 拼接后按分数降序取 Top_NUM=5
+  （注意：源码是"两分支合并后取前 5"，并不是"每分支各取前 5 共 10 个"；本工具如实记录这 5 个，
+  另外把两分支各自前 5 作为 `branch_top5` 参考列表输出，两者含义不同，不可混用）；
+  每个候选的真实背景惩罚 = simple_matching 返回分数的最大值（:472-478）；
+  IoU 奖励是同一帧 5 个候选之间 IoU>0.8 的互相奖励（:482-497，并非"历史框"奖励）；
+  最终得分取自 _process_gallary 的真实返回值；由于 update 传入 rescale=True，tra/det/最终框已是原图坐标；
+- Layer 6 模板更新：源码 :500 条件为 tra_bboxes[0,-1] + det_bboxes[0,-1] > 1.9 且 IoU(det[0], tra[0]) > 0.8，
+  更新为 EMA：_bbox_feats_z = (1 - lr) * _bbox_feats_z + lr * new（:402，lr 由 _process_query:353 设为 0.01，
+  本工具运行时直接读取 model._learning_rate），同时背景记忆 _bbox_feats_bg 被整体替换（:421-426）。
+
+运行模式：
+- `--offline-geometry-check`：仅几何/IO 纯函数离线检查（纯标准库，可在无 GPU 本机运行；不加载模型）；
+- `--model-smoke`：在 Colab GPU 上实例化真实 SiamDTRCNN，跑 1 条序列前 5 帧，断言每个 hook/包装都捕获到非空且形状合理的张量；
+- 默认模式：对指定序列关键帧输出 6 层解剖图与 JSON 指标。
+Holdout 封存：默认拒绝处理 holdout 序列（holdout_verification.json 以及 val90_full.json 的 holdout_full_36），
+除非显式传入 `--unlock-holdout`，且解封结果写入独立的 HOLDOUT_UNSEALED 目录。
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import math
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -48,25 +63,67 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
+PROBE_VERSION = "2.0.0-rev20261104"
 
 # ==============================================================================
-# 1. 几何与空间激活量化指标计算工具 (纯 NumPy / Torch 兼容)
+# 0. 源码常量（全部注明出处；运行时能从模型读到的量以运行时为准）
+# ==============================================================================
+SOURCE_TOP_NUM = 5                    # siamdt_rcnn.py:456  Top_NUM = 5
+SOURCE_IOU_REWARD_THR = 0.8           # siamdt_rcnn.py:496  if iouvalue > 0.8
+SOURCE_UPDATE_SCORE_SUM_THR = 1.9     # siamdt_rcnn.py:500  tra[0,-1] + det[0,-1] > 1.9
+SOURCE_UPDATE_IOU_THR = 0.8           # siamdt_rcnn.py:500  computeiou(det[0], tra[0]) > 0.8
+SOURCE_EMA_LR_AT_INIT = 0.01          # siamdt_rcnn.py:353  self._learning_rate = 0.01（运行时以 model._learning_rate 为准）
+SOURCE_BG_BANK_MAX = 11               # siamdt_rcnn.py:382/418  len(bgproposals) > 10 -> break（最多 11 个）
+
+# 分析者阈值（非模型行为；仅用于事后诊断标签，必须在输出中标注）
+ANALYST_UPDATE_GT_IOU_THR = 0.5       # 模板更新所用框与 GT 的 IoU 低于该值 -> 事后标记"可疑更新"
+ANALYST_RPN_MISS_IOU = 0.30
+ANALYST_RANK_INV_BEST_IOU = 0.50
+ANALYST_RANK_INV_SELECTED_IOU = 0.30
+
+PROV_CAPTURED = "captured_model_path"
+PROV_RECOMPUTED = "recomputed_by_source_formula"
+PROV_DERIVED = "posthoc_derived_not_model_path"
+PROV_ANALYST = "analyst_heuristic_label"
+
+FIELD_PROVENANCE: Dict[str, str] = {
+    "layer1.*.l2_map / shape": PROV_CAPTURED + "（shape）；l2_map 为通道 L2 范数 = " + PROV_DERIVED,
+    "layer1/2/3a.*.target_to_bg_activation_ratio / margin / entropy": PROV_DERIVED,
+    "layer2.*": "同 layer1",
+    "layer3a_rpn_modulation.*": "proj_out[k] 输出张量为 " + PROV_CAPTURED + "；空间图为通道 L2 范数 = " + PROV_DERIVED,
+    "layer3b_rcnn_similarity.per_roi_l2_energy": "proj_out 输出为 " + PROV_CAPTURED + "；逐 ROI L2 能量 = " + PROV_DERIVED,
+    "layer4.proposals_orig_xyxy / score": PROV_CAPTURED + "（坐标按 scale_factor 还原原图）",
+    "layer4.*_max_iou / hit_count": PROV_DERIVED + "（与 GT 比较）",
+    "layer5.candidates[].bbox_xyxy / final_score": PROV_CAPTURED + "（_process_gallary 返回值）",
+    "layer5.candidates[].branch / pre_bg_supp_score": PROV_CAPTURED + "（与 simple_test_bboxes 返回的 tra/det 行做精确坐标匹配）",
+    "layer5.candidates[].bg_penalty": PROV_CAPTURED + "（simple_matching 返回分数的 max）",
+    "layer5.candidates[].post_bg_score / iou_reward": PROV_RECOMPUTED + "（源码 :478 / :497 的加减关系，由真实量反推）",
+    "layer5.candidates[].gt_iou / selected_by_tracker": PROV_DERIVED + " / " + PROV_CAPTURED,
+    "layer5.branch_top5": PROV_CAPTURED + "（两分支各自前 5，仅参考，并非源码决赛圈）",
+    "layer6.template_updated": PROV_CAPTURED + "（_process_gallary 返回的 up_flag）",
+    "layer6.source_update_condition": PROV_RECOMPUTED + "（源码 :500 公式，用于与 up_flag 一致性核对）",
+    "layer6.learning_rate": PROV_CAPTURED + "（model._learning_rate）",
+    "layer6.update_box_orig_xyxy": PROV_CAPTURED + "（_update_query 入参，按 scale_factor 还原原图）",
+    "layer6.update_box_gt_iou / posthoc_suspicious_update": PROV_DERIVED + " / " + PROV_ANALYST,
+    "layer6.template_cosine_sim_to_init / l2_drift / init_template_residual_weight": PROV_DERIVED,
+    "root_cause_verdict": PROV_ANALYST,
+}
+
+
+# ==============================================================================
+# 1. 纯标准库几何 / IO 工具（--offline-geometry-check 覆盖范围）
 # ==============================================================================
 
-def xywh_to_xyxy(box_xywh: List[float]) -> List[float]:
+def xywh_to_xyxy(box_xywh: Sequence[float]) -> List[float]:
     x, y, w, h = [float(v) for v in box_xywh[:4]]
     return [x, y, x + max(0.0, w), y + max(0.0, h)]
 
 
-def compute_iou_xyxy(box_a: List[float], box_b: List[float]) -> float:
+def compute_iou_xyxy(box_a: Sequence[float], box_b: Sequence[float]) -> float:
     ax1, ay1, ax2, ay2 = [float(v) for v in box_a[:4]]
     bx1, by1, bx2, by2 = [float(v) for v in box_b[:4]]
-    ix1 = max(ax1, bx1)
-    iy1 = max(ay1, by1)
-    ix2 = min(ax2, bx2)
-    iy2 = min(ay2, by2)
-    iw = max(0.0, ix2 - ix1)
-    ih = max(0.0, iy2 - iy1)
+    iw = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+    ih = max(0.0, min(ay2, by2) - max(ay1, by1))
     inter = iw * ih
     if inter <= 0.0:
         return 0.0
@@ -76,100 +133,149 @@ def compute_iou_xyxy(box_a: List[float], box_b: List[float]) -> float:
     return float(inter / union) if union > 0.0 else 0.0
 
 
-def compute_spatial_map_metrics(
-    activation_map: "np.ndarray",
-    gt_xywh: List[float],
-    img_h: int,
-    img_w: int,
-    guard_dilation_factor: float = 1.5,
-) -> Dict[str, float]:
+def source_computeiou(bbox1: Sequence[float], bbox2: Sequence[float]) -> float:
+    """逐行复刻 siamdt_rcnn.py:318-349 SiamDTRCNN.computeiou（用于复算源码 :496 / :500 条件）。"""
+    x0_1, y0_1, x1_1, y1_1 = [float(x) for x in bbox1[:4]]
+    x0_2, y0_2, x1_2, y1_2 = [float(x) for x in bbox2[:4]]
+    overlap_x0 = max(x0_1, x0_2)
+    overlap_y0 = max(y0_1, y0_2)
+    overlap_x1 = min(x1_1, x1_2)
+    overlap_y1 = min(y1_1, y1_2)
+    if overlap_x1 - overlap_x0 <= 0 or overlap_y1 - overlap_y0 <= 0:
+        return 0.0
+    size_1 = (x1_1 - x0_1) * (y1_1 - y0_1)
+    size_2 = (x1_2 - x0_2) * (y1_2 - y0_2)
+    size_intersection = (overlap_x1 - overlap_x0) * (overlap_y1 - overlap_y0)
+    size_union = size_1 + size_2 - size_intersection
+    return size_intersection / size_union
+
+
+def normalize_scale_factor(scale_factor: Any) -> Optional[List[float]]:
+    """把 img_meta['scale_factor']（标量或长度 4 的数组）规范为 4 元列表；无法识别则返回 None（不猜测）。"""
+    if scale_factor is None:
+        return None
+    raw = scale_factor.tolist() if hasattr(scale_factor, "tolist") else scale_factor
+    if isinstance(raw, (int, float)):
+        vals = [float(raw)] * 4
+    else:
+        try:
+            vals = [float(v) for v in raw]
+        except Exception:
+            return None
+        if len(vals) == 1:
+            vals = vals * 4
+    if len(vals) != 4 or any((not math.isfinite(v)) or v <= 0.0 for v in vals):
+        return None
+    return vals
+
+
+def boxes_net_to_orig(boxes: Sequence[Sequence[float]], sf4: Optional[List[float]]) -> Optional[List[List[float]]]:
+    """网络输入尺度 -> 原图尺度：前 4 列除以 scale_factor，其余列（如分数）原样保留。sf4 为 None 时返回 None。"""
+    if sf4 is None:
+        return None
+    out: List[List[float]] = []
+    for b in boxes:
+        row = [float(b[0]) / sf4[0], float(b[1]) / sf4[1], float(b[2]) / sf4[2], float(b[3]) / sf4[3]]
+        row.extend(float(v) for v in b[4:])
+        out.append(row)
+    return out
+
+
+def match_candidate_provenance(
+    final_rows: Sequence[Sequence[float]],
+    tra_rows: Sequence[Sequence[float]],
+    det_rows: Sequence[Sequence[float]],
+) -> List[Dict[str, Any]]:
     """
-    针对任意二维空间激活图/响应图 `activation_map` (H_map, W_map)，计算三大核心量化诊断指标：
-    1. `target_to_bg_activation_ratio`:
-       GT 目标框内平均激活能量 / 背景区域平均激活能量；
-    2. `target_vs_strongest_distractor_margin`:
-       (GT 区域峰值激活 - 保护带外最强背景干扰峰激活) / (全局动态范围 + eps)；
-    3. `response_entropy`:
-       归一化二维空间香农熵 H / log(N) in [0, 1]，越小代表响应越集中尖锐，越大代表被背景噪声弥散淹没。
+    对 _process_gallary 返回的 Top-5 候选做"精确坐标匹配"溯源：
+    源码 :463-497 只修改 newens_bboxes 的分数列，坐标列与 tra/det 中被选中的行逐位相同，
+    因此坐标精确相等即可唯一确定分支来源与抑制前原始分数；若两分支出现相同坐标则标记 ambiguous 且不猜分数。
     """
-    import numpy as np
+    out: List[Dict[str, Any]] = []
+    tra_boxes = [[float(v) for v in r[:4]] for r in tra_rows]
+    det_boxes = [[float(v) for v in r[:4]] for r in det_rows]
+    for i, row in enumerate(final_rows):
+        box = [float(v) for v in row[:4]]
+        t_idx = [j for j, b in enumerate(tra_boxes) if b == box]
+        d_idx = [j for j, b in enumerate(det_boxes) if b == box]
+        if t_idx and not d_idx:
+            branch = "similarity_tracking_branch(tra)"
+            scores = {float(tra_rows[j][4]) for j in t_idx}
+        elif d_idx and not t_idx:
+            branch = "detection_branch(det)"
+            scores = {float(det_rows[j][4]) for j in d_idx}
+        elif t_idx and d_idx:
+            branch = "ambiguous_both_branches"
+            scores = {float(tra_rows[j][4]) for j in t_idx} | {float(det_rows[j][4]) for j in d_idx}
+        else:
+            branch = "unmatched"
+            scores = set()
+        out.append({
+            "rank_pre_suppression": i + 1,
+            "branch": branch,
+            "tra_row_indices": t_idx,
+            "det_row_indices": d_idx,
+            "pre_bg_supp_score": scores.pop() if len(scores) == 1 else None,
+        })
+    return out
 
-    arr = np.asarray(activation_map, dtype=np.float64)
-    if arr.ndim > 2:
-        arr = arr.squeeze()
-    hm, wm = arr.shape[:2]
-    if hm == 0 or wm == 0:
-        return {
-            "target_to_bg_activation_ratio": 0.0,
-            "target_vs_strongest_distractor_margin": 0.0,
-            "response_entropy": 1.0,
-            "target_peak": 0.0,
-            "strongest_distractor_peak": 0.0,
-        }
 
-    # Shift to non-negative energy
-    arr_min = float(np.min(arr))
-    arr_max = float(np.max(arr))
-    span = max(1e-8, arr_max - arr_min)
-    norm_arr = (arr - arr_min) / span
+def decompose_candidate_scores(
+    final_rows: Sequence[Sequence[float]],
+    provenance: Sequence[Dict[str, Any]],
+    bg_penalties: Optional[Sequence[Optional[float]]],
+) -> List[Dict[str, Any]]:
+    """组合真实捕获量：pre（捕获）、bg_penalty（捕获）、final（捕获）；post_bg 与 iou_reward 为源码算术关系反推。"""
+    cands: List[Dict[str, Any]] = []
+    pens_ok = bg_penalties is not None and len(bg_penalties) == len(final_rows)
+    for i, row in enumerate(final_rows):
+        prov = provenance[i] if i < len(provenance) else {}
+        pre = prov.get("pre_bg_supp_score")
+        pen = float(bg_penalties[i]) if (pens_ok and bg_penalties[i] is not None) else None
+        final = float(row[4]) if len(row) > 4 else None
+        post = (pre - pen) if (pre is not None and pen is not None) else None
+        reward = (final - post) if (final is not None and post is not None) else None
+        cands.append({
+            "rank_pre_suppression": i + 1,
+            "bbox_xyxy": [float(v) for v in row[:4]],
+            "branch": prov.get("branch"),
+            "pre_bg_supp_score": pre,
+            "bg_penalty": pen,
+            "post_bg_score": post,
+            "iou_reward": reward,
+            "final_score": final,
+        })
+    return cands
 
-    # Normalized Shannon entropy
-    prob = norm_arr + 1e-12
-    prob = prob / np.sum(prob)
-    n_cells = hm * wm
-    entropy = float(-np.sum(prob * np.log(prob)) / math.log(max(2, n_cells)))
 
-    gx, gy, gw, gh = [float(v) for v in gt_xywh[:4]]
-    if gw <= 0.0 or gh <= 0.0 or img_w <= 0 or img_h <= 0:
-        return {
-            "target_to_bg_activation_ratio": 0.0,
-            "target_vs_strongest_distractor_margin": 0.0,
-            "response_entropy": round(entropy, 6),
-            "target_peak": 0.0,
-            "strongest_distractor_peak": round(float(np.max(norm_arr)), 6),
-        }
-
-    # Map GT box to feature map coordinates (ensure at least 1x1 cell for tiny targets)
-    sx = wm / float(img_w)
-    sy = hm / float(img_h)
-    u1 = max(0, min(wm - 1, int(math.floor(gx * sx))))
-    v1 = max(0, min(hm - 1, int(math.floor(gy * sy))))
-    u2 = max(u1 + 1, min(wm, int(math.ceil((gx + gw) * sx))))
-    v2 = max(v1 + 1, min(hm, int(math.ceil((gy + gh) * sy))))
-
-    # Guard zone around GT to separate true target lobe from external background distractors
-    cx, cy = gx + 0.5 * gw, gy + 0.5 * gh
-    guard_w = max(gw * guard_dilation_factor, 16.0)
-    guard_h = max(gh * guard_dilation_factor, 16.0)
-    gu1 = max(0, min(wm - 1, int(math.floor((cx - 0.5 * guard_w) * sx))))
-    gv1 = max(0, min(hm - 1, int(math.floor((cy - 0.5 * guard_h) * sy))))
-    gu2 = max(gu1 + 1, min(wm, int(math.ceil((cx + 0.5 * guard_w) * sx))))
-    gv2 = max(gv1 + 1, min(hm, int(math.ceil((cy + 0.5 * guard_h) * sy))))
-
-    target_patch = norm_arr[v1:v2, u1:u2]
-    bg_mask = np.ones((hm, wm), dtype=bool)
-    bg_mask[gv1:gv2, gu1:gu2] = False
-    bg_vals = norm_arr[bg_mask]
-    if bg_vals.size == 0:
-        bg_mask = np.ones((hm, wm), dtype=bool)
-        bg_mask[v1:v2, u1:u2] = False
-        bg_vals = norm_arr[bg_mask]
-
-    target_mean = float(np.mean(target_patch)) if target_patch.size > 0 else 0.0
-    bg_mean = float(np.mean(bg_vals)) if bg_vals.size > 0 else 1e-6
-    ratio = float(target_mean / max(1e-6, bg_mean))
-
-    target_peak = float(np.max(target_patch)) if target_patch.size > 0 else 0.0
-    distractor_peak = float(np.max(bg_vals)) if bg_vals.size > 0 else 0.0
-    margin = float(target_peak - distractor_peak)
-
+def source_update_condition(
+    tra_rows: Sequence[Sequence[float]],
+    det_rows: Sequence[Sequence[float]],
+) -> Optional[Dict[str, Any]]:
+    """复算源码 :500 的模板更新条件（使用 tra/det 第 0 行，与源码一致；不排序、不改阈值）。"""
+    if not tra_rows or not det_rows:
+        return None
+    tra0, det0 = tra_rows[0], det_rows[0]
+    s_sum = float(tra0[4]) + float(det0[4])
+    iou = source_computeiou(det0[:4], tra0[:4])
     return {
-        "target_to_bg_activation_ratio": round(ratio, 6),
-        "target_vs_strongest_distractor_margin": round(margin, 6),
-        "response_entropy": round(entropy, 6),
-        "target_peak": round(target_peak, 6),
-        "strongest_distractor_peak": round(distractor_peak, 6),
+        "tra_top1_score": float(tra0[4]),
+        "det_top1_score": float(det0[4]),
+        "score_sum": s_sum,
+        "score_sum_threshold_source": SOURCE_UPDATE_SCORE_SUM_THR,
+        "tra_det_top1_iou": iou,
+        "iou_threshold_source": SOURCE_UPDATE_IOU_THR,
+        "condition_met": bool(s_sum > SOURCE_UPDATE_SCORE_SUM_THR and iou > SOURCE_UPDATE_IOU_THR),
     }
+
+
+def rows_without_iou_reward_partner(final_rows: Sequence[Sequence[float]]) -> List[int]:
+    """返回与其它候选的 source_computeiou 均 <= 0.8 的行号；对这些行源码 :497 不加奖励，可用于核对 final == pre - penalty。"""
+    idxs: List[int] = []
+    for i, a in enumerate(final_rows):
+        if all(source_computeiou(a[:4], b[:4]) <= SOURCE_IOU_REWARD_THR for j, b in enumerate(final_rows) if j != i):
+            idxs.append(i)
+    return idxs
 
 
 def select_diagnostic_keyframes(
@@ -177,13 +283,7 @@ def select_diagnostic_keyframes(
     onset_frame: int,
     explicit_frames: Optional[List[int]] = None,
 ) -> List[Tuple[int, str]]:
-    """
-    自动围绕失败起点帧 `onset_frame` 截取标准四阶段诊断关键帧：
-    - `Pre-Failure [-10, -3]`
-    - `Failure Onset [0]`
-    - `Drift [+5]`
-    - `Recovery/Terminal [+15]`
-    """
+    """围绕失败起点帧截取 [-10, -3, 0, +5, +15] 关键帧（或使用显式帧号）。"""
     if explicit_frames:
         out: List[Tuple[int, str]] = []
         for f in explicit_frames:
@@ -199,14 +299,8 @@ def select_diagnostic_keyframes(
                 tag = f"Recovery/Terminal [{rel:+d}]"
             out.append((idx, tag))
         return out
-
-    offsets = [
-        (-10, "Pre-Failure [-10]"),
-        (-3, "Pre-Failure [-3]"),
-        (0, "Failure Onset [0]"),
-        (+5, "Drift [+5]"),
-        (+15, "Recovery/Terminal [+15]"),
-    ]
+    offsets = [(-10, "Pre-Failure [-10]"), (-3, "Pre-Failure [-3]"), (0, "Failure Onset [0]"),
+               (+5, "Drift [+5]"), (+15, "Recovery/Terminal [+15]")]
     seen = set()
     selected: List[Tuple[int, str]] = []
     for delta, label in offsets:
@@ -217,237 +311,372 @@ def select_diagnostic_keyframes(
     return selected
 
 
+# ------------------------------------------------------------------------------
+# Holdout 封存护栏（fail-closed：找不到 holdout 清单时也拒绝，除非显式解封）
+# ------------------------------------------------------------------------------
+class HoldoutSealedError(RuntimeError):
+    pass
+
+
+def _default_split_dirs() -> List[Path]:
+    dirs: List[Path] = []
+    try:
+        here = Path(__file__).resolve()
+        dirs.append(here.parents[1] / "datasets" / "diagnostic_splits")
+    except Exception:
+        pass
+    dirs.extend([
+        Path("/content/runtime/SimDT_Pipeline/datasets/diagnostic_splits"),
+        Path("/content/drive/MyDrive/SiamDT_Project/datasets/diagnostic_splits"),
+        Path("/content/drive/MyDrive/SimDT围点打援/datasets/diagnostic_splits"),
+        Path(r"G:\我的云端硬盘\SimDT围点打援\datasets\diagnostic_splits"),
+    ])
+    return dirs
+
+
+def load_holdout_sequence_set(holdout_json: Optional[Path] = None) -> Tuple[Optional[set], List[str]]:
+    """
+    读取 holdout 序列集合：holdout_verification.json 的 sequences（Core 16）
+    ∪ 同目录 val90_full.json 的 holdout_full_36.sequences（若存在）。返回 (集合或 None, 来源文件列表)。
+    """
+    cands: List[Path] = [holdout_json] if holdout_json else [d / "holdout_verification.json" for d in _default_split_dirs()]
+    for hj in cands:
+        if hj is None or not hj.exists():
+            continue
+        data = json.loads(hj.read_text(encoding="utf-8"))
+        seqs = set(str(s) for s in data.get("sequences", []))
+        sources = [str(hj)]
+        v90 = hj.parent / "val90_full.json"
+        if v90.exists():
+            try:
+                vdata = json.loads(v90.read_text(encoding="utf-8"))
+                seqs |= set(str(s) for s in vdata.get("holdout_full_36", {}).get("sequences", []))
+                sources.append(str(v90))
+            except Exception:
+                pass
+        if seqs:
+            return seqs, sources
+    return None, []
+
+
+def enforce_holdout_guard(seq_id: str, unlock_holdout: bool, holdout_json: Optional[Path] = None) -> Dict[str, Any]:
+    holdout_set, sources = load_holdout_sequence_set(holdout_json)
+    if holdout_set is None:
+        if unlock_holdout:
+            return {"holdout_check": "UNVERIFIED_UNLOCKED", "is_holdout": None, "sources": []}
+        raise HoldoutSealedError(
+            "未找到 holdout_verification.json，无法确认该序列是否属于 Holdout，按封存规则拒绝执行；"
+            "请用 --holdout-json 指定清单，或在确认需要解封时显式传入 --unlock-holdout。"
+        )
+    is_holdout = seq_id in holdout_set
+    if is_holdout and not unlock_holdout:
+        raise HoldoutSealedError(
+            f"序列 {seq_id} 属于 Holdout（封存集），默认拒绝处理；如确需解封请显式传入 --unlock-holdout（结果将写入独立 HOLDOUT_UNSEALED 目录）。"
+        )
+    return {"holdout_check": "PASSED", "is_holdout": is_holdout, "sources": sources}
+
+
+def load_discovery_first_sequence() -> Optional[str]:
+    for d in _default_split_dirs():
+        f = d / "discovery_set.json"
+        if f.exists():
+            seqs = json.loads(f.read_text(encoding="utf-8")).get("sequences", [])
+            if seqs:
+                return str(seqs[0])
+    return None
+
+
 # ==============================================================================
-# 2. 非侵入式 PyTorch 6 层 Forward Hook 探针管理器 (SiamDT6LayerHookManager)
+# 2. 需要 numpy 的派生指标（事后派生，非模型路径）
 # ==============================================================================
+
+def compute_spatial_map_metrics(activation_map: Any, gt_xywh: List[float], img_h: int, img_w: int,
+                                guard_dilation_factor: float = 1.5) -> Dict[str, Any]:
+    """【事后派生，非模型路径】对二维图计算 GT 区域/背景能量比、峰值裕度与归一化熵。"""
+    import numpy as np
+
+    arr = np.asarray(activation_map, dtype=np.float64)
+    if arr.ndim > 2:
+        arr = arr.squeeze()
+    hm, wm = arr.shape[:2]
+    empty = {"target_to_bg_activation_ratio": None, "target_vs_strongest_distractor_margin": None,
+             "response_entropy": None, "target_peak": None, "strongest_distractor_peak": None,
+             "provenance": PROV_DERIVED}
+    if hm == 0 or wm == 0:
+        return empty
+    span = max(1e-8, float(arr.max()) - float(arr.min()))
+    norm_arr = (arr - float(arr.min())) / span
+    prob = norm_arr + 1e-12
+    prob = prob / np.sum(prob)
+    entropy = float(-np.sum(prob * np.log(prob)) / math.log(max(2, hm * wm)))
+    gx, gy, gw, gh = [float(v) for v in gt_xywh[:4]]
+    if gw <= 0.0 or gh <= 0.0 or img_w <= 0 or img_h <= 0:
+        empty["response_entropy"] = round(entropy, 6)
+        return empty
+    sx, sy = wm / float(img_w), hm / float(img_h)
+    u1 = max(0, min(wm - 1, int(math.floor(gx * sx))))
+    v1 = max(0, min(hm - 1, int(math.floor(gy * sy))))
+    u2 = max(u1 + 1, min(wm, int(math.ceil((gx + gw) * sx))))
+    v2 = max(v1 + 1, min(hm, int(math.ceil((gy + gh) * sy))))
+    cx, cy = gx + 0.5 * gw, gy + 0.5 * gh
+    guard_w, guard_h = max(gw * guard_dilation_factor, 16.0), max(gh * guard_dilation_factor, 16.0)
+    gu1 = max(0, min(wm - 1, int(math.floor((cx - 0.5 * guard_w) * sx))))
+    gv1 = max(0, min(hm - 1, int(math.floor((cy - 0.5 * guard_h) * sy))))
+    gu2 = max(gu1 + 1, min(wm, int(math.ceil((cx + 0.5 * guard_w) * sx))))
+    gv2 = max(gv1 + 1, min(hm, int(math.ceil((cy + 0.5 * guard_h) * sy))))
+    target_patch = norm_arr[v1:v2, u1:u2]
+    bg_mask = np.ones((hm, wm), dtype=bool)
+    bg_mask[gv1:gv2, gu1:gu2] = False
+    bg_vals = norm_arr[bg_mask]
+    if bg_vals.size == 0:
+        bg_mask = np.ones((hm, wm), dtype=bool)
+        bg_mask[v1:v2, u1:u2] = False
+        bg_vals = norm_arr[bg_mask]
+    t_mean = float(np.mean(target_patch)) if target_patch.size else None
+    b_mean = float(np.mean(bg_vals)) if bg_vals.size else None
+    t_peak = float(np.max(target_patch)) if target_patch.size else None
+    d_peak = float(np.max(bg_vals)) if bg_vals.size else None
+    return {
+        "target_to_bg_activation_ratio": round(t_mean / max(1e-6, b_mean), 6) if (t_mean is not None and b_mean is not None) else None,
+        "target_vs_strongest_distractor_margin": round(t_peak - d_peak, 6) if (t_peak is not None and d_peak is not None) else None,
+        "response_entropy": round(entropy, 6),
+        "target_peak": round(t_peak, 6) if t_peak is not None else None,
+        "strongest_distractor_peak": round(d_peak, 6) if d_peak is not None else None,
+        "provenance": PROV_DERIVED,
+    }
+
+
+# ==============================================================================
+# 3. 非侵入式 hook + 方法包装管理器（只读捕获，不改变任何返回值）
+# ==============================================================================
+
+def _to_py(v: Any) -> Any:
+    if v is None:
+        return None
+    if hasattr(v, "detach"):
+        v = v.detach().float().cpu()
+    if hasattr(v, "tolist"):
+        return v.tolist()
+    if isinstance(v, (list, tuple)):
+        return [_to_py(x) for x in v]
+    return v
+
 
 class SiamDT6LayerHookManager:
     """
-    在原始 `SiamDTRCNN` 上通过 `register_forward_hook` 非侵入式挂载 6 层特征探针：
-    - Layer 1: `model.backbone` -> Swin-Tiny Stages 1~4 (`C2~C5`)
-    - Layer 2: `model.neck` -> 5-Level FPN (`P2~P6`)
-    - Layer 3: `model.rpn_similarity_learning.proj_out[0..4]` & `model.rpn_head`
-               -> DS-RPN 互相关响应图 (Cross-Correlation Map) + 二阶格拉姆矩阵响应图 (Gram Matrix Map)
-    - Layer 4: `model.roi_head.bbox_roi_extractor` & `model.rpn_head`
-               -> RPN Top-64 Proposals 空间分布与最大 IoU
-    - Layer 5: `model.roi_head.bbox_head`
-               -> Versatile R-CNN (Tracking 分支 + Detection 分支) 决赛圈 Top-5 候选框竞争与排序倒挂诊断
-    - Layer 6: `model.rcnn_similarity_learning` & `model._bbox_feats_z` / `model._bbox_feats_bg`
-               -> 动态模板特征 (1x256x7x7) + 11 路背景抑制前后激活对比 + 模板污染审计
+    - forward hook：backbone / neck / rpn_similarity_learning.proj_out[k] / rpn_head / rcnn_similarity_learning.proj_out；
+    - 实例级方法包装（只观测入参与返回值，原样返回）：_process_gallary / simple_test_bboxes / simple_matching / _update_query。
+    包装通过在模型实例 __dict__ 中放置同名可调用对象实现，remove_hooks() 会删除这些实例属性，恢复类方法。
     """
 
-    def __init__(self, model: Any) -> None:
-        import torch
+    WRAPPED_METHODS = ("_process_gallary", "simple_test_bboxes", "simple_matching", "_update_query")
 
+    def __init__(self, model: Any) -> None:
         self.model = model
         self.handles: List[Any] = []
+        self._phase: str = "other"
         self.frame_buffer: Dict[str, Any] = {}
-        self.initial_template_feat: Optional["torch.Tensor"] = None
-        self._register_all_hooks()
+        self.initial_template_feat: Any = None
+        self.cumulative_update_count: int = 0
+        self.clear_frame_buffer()
+        self._register_hooks()
+        self._install_wrappers()
 
     def clear_frame_buffer(self) -> None:
         self.frame_buffer = {
             "layer1_backbone_stages": [],
             "layer2_fpn_levels": [],
-            "layer3_rpn_xcorr_levels": [None] * 5,
-            "layer3_rpn_cls_scores": [],
-            "layer3_rpn_bbox_preds": [],
-            "layer4_roi_extractor_calls": [],
-            "layer5_bbox_head_calls": [],
-            "layer6_rcnn_sim_calls": [],
+            "layer3a_rpn_modulation_levels": [None] * 5,
+            "layer3a_call_count": 0,
+            "rpn_objectness_maps": [],
+            "layer3b_rcnn_similarity_calls": [],
+            "img_meta_x": None,
+            "learning_rate": None,
+            "rpn_proposals_net": None,
+            "simple_test_bboxes_rescale": None,
+            "tra_bboxes": None,
+            "det_bboxes": None,
+            "bg_matching_calls": [],
+            "final_results": None,
+            "up_flag": None,
+            "update_query_calls": [],
+            "process_gallary_calls": 0,
         }
 
     @staticmethod
-    def _l2_spatial_map(feat_tensor: Any) -> "np.ndarray":
+    def _l2_spatial_map(feat_tensor: Any) -> Any:
         import torch
-
         t = feat_tensor.detach().float()
         if t.dim() == 4:
             t = t[0]
-        # L2 norm across channel dimension C -> (H, W)
-        l2_map = torch.norm(t, p=2, dim=0)
-        return l2_map.cpu().numpy()
+        return torch.norm(t, p=2, dim=0).cpu().numpy()
 
-    @staticmethod
-    def compute_gram_matrix_response(
-        template_feat: Any,
-        fpn_feat: Any,
-    ) -> "np.ndarray":
-        """
-        计算二阶格拉姆矩阵响应图 (Second-Order Gram Matrix Similarity Map)：
-        给定模板特征 Z in R^{1 x C x 7 x 7} 与搜索特征 X in R^{1 x C x H x W}，
-        先对通道向量做 L2 归一化，令 G_z = (1/49) * Z_flat @ Z_flat^T in R^{C x C}，
-        则位置 (u, v) 的二阶格拉姆协方差匹配响应为：
-        R_Gram(u, v) = x(u,v)^T G_z x(u,v) = (1/49) * sum_{m=1}^{49} (z_m^T x(u,v))^2
-        """
+    # ------------------------------------------------------------------
+    def _register_hooks(self) -> None:
         import torch
-        import torch.nn.functional as F
+        m = self.model
 
-        z = template_feat.detach().float()
-        x = fpn_feat.detach().float()
-        if z.dim() == 4:
-            z = z[0]  # (C, 7, 7)
-        if x.dim() == 4:
-            x = x[0]  # (C, H, W)
-        c, h, w = x.shape
-        z_flat = F.normalize(z.reshape(c, -1), p=2, dim=0)  # (C, 49)
-        x_flat = F.normalize(x.reshape(c, -1), p=2, dim=0)  # (C, H*W)
-        # (49, C) @ (C, H*W) -> (49, H*W)
-        proj = torch.matmul(z_flat.t(), x_flat)
-        gram_resp = torch.mean(proj ** 2, dim=0).reshape(h, w)
-        return gram_resp.cpu().numpy()
-
-    def _register_all_hooks(self) -> None:
-        import torch
-
-        self.clear_frame_buffer()
-
-        # ------------------------------------------------------------------
-        # Layer 1 Hook: Swin-Tiny Backbone Stages 1~4 (C2, C3, C4, C5)
-        # ------------------------------------------------------------------
-        def _hook_layer1_backbone(module: Any, inputs: Any, output: Any) -> None:
+        def _hook_backbone(module: Any, inputs: Any, output: Any) -> None:
             if isinstance(output, (tuple, list)):
-                stages = []
-                for idx, feat in enumerate(output):
-                    if torch.is_tensor(feat):
-                        stages.append({
-                            "stage_index": idx + 1,
-                            "stage_name": f"Stage{idx + 1}_C{idx + 2}",
-                            "shape": list(feat.shape),
-                            "l2_map": self._l2_spatial_map(feat),
-                        })
-                self.frame_buffer["layer1_backbone_stages"] = stages
-
-        self.handles.append(self.model.backbone.register_forward_hook(_hook_layer1_backbone))
-
-        # ------------------------------------------------------------------
-        # Layer 2 Hook: 5-Level FPN (P2, P3, P4, P5, P6)
-        # ------------------------------------------------------------------
-        def _hook_layer2_fpn(module: Any, inputs: Any, output: Any) -> None:
-            if isinstance(output, (tuple, list)):
-                levels = []
-                for idx, feat in enumerate(output):
-                    if torch.is_tensor(feat):
-                        levels.append({
-                            "level_index": idx,
-                            "level_name": f"P{idx + 2}",
-                            "stride": 2 ** (idx + 2),
-                            "shape": list(feat.shape),
-                            "tensor": feat.detach(),
-                            "l2_map": self._l2_spatial_map(feat),
-                        })
-                self.frame_buffer["layer2_fpn_levels"] = levels
-
-        self.handles.append(self.model.neck.register_forward_hook(_hook_layer2_fpn))
-
-        # ------------------------------------------------------------------
-        # Layer 3 Hook A: DS-RPN Cross-Correlation proj_out[0..4]
-        # 注意：RPN_Similarity_Learning.forward 是 generator，因此直接挂载其内部
-        # nn.ModuleList `proj_out[k]`，安全拿到每一层 x_corr[k] 张量！
-        # ------------------------------------------------------------------
-        if hasattr(self.model, "rpn_similarity_learning") and hasattr(
-            self.model.rpn_similarity_learning, "proj_out"
-        ):
-            for lvl_idx, conv_mod in enumerate(self.model.rpn_similarity_learning.proj_out):
-                def _make_xcorr_hook(k: int):
-                    def _hook_xcorr(module: Any, inputs: Any, output: Any) -> None:
-                        if torch.is_tensor(output):
-                            self.frame_buffer["layer3_rpn_xcorr_levels"][k] = {
-                                "level_name": f"P{k + 2}",
-                                "shape": list(output.shape),
-                                "l2_map": self._l2_spatial_map(output),
-                            }
-                    return _hook_xcorr
-
-                self.handles.append(conv_mod.register_forward_hook(_make_xcorr_hook(lvl_idx)))
-
-        # ------------------------------------------------------------------
-        # Layer 3 Hook B: RPNHead (cls_scores & bbox_preds across P2~P6)
-        # ------------------------------------------------------------------
-        def _hook_layer3_rpn_head(module: Any, inputs: Any, output: Any) -> None:
-            if isinstance(output, (tuple, list)) and len(output) == 2:
-                cls_scores, bbox_preds = output
-                cls_maps = []
-                for idx, sc in enumerate(cls_scores):
-                    if torch.is_tensor(sc):
-                        # sc: (1, num_anchors, H, W) -> max foreground probability across anchors
-                        prob_map = torch.sigmoid(sc.detach().float()[0]).max(dim=0)[0].cpu().numpy()
-                        cls_maps.append({
-                            "level_name": f"P{idx + 2}",
-                            "shape": list(sc.shape),
-                            "prob_map": prob_map,
-                        })
-                self.frame_buffer["layer3_rpn_cls_scores"] = cls_maps
-                self.frame_buffer["layer3_rpn_bbox_preds"] = [
-                    b.detach() for b in bbox_preds if torch.is_tensor(b)
+                self.frame_buffer["layer1_backbone_stages"] = [
+                    {"stage_index": i + 1, "stage_name": f"Stage{i + 1}_C{i + 2}", "shape": list(f.shape),
+                     "l2_map": self._l2_spatial_map(f)}
+                    for i, f in enumerate(output) if torch.is_tensor(f)
                 ]
 
-        self.handles.append(self.model.rpn_head.register_forward_hook(_hook_layer3_rpn_head))
+        self.handles.append(m.backbone.register_forward_hook(_hook_backbone))
 
-        # ------------------------------------------------------------------
-        # Layer 4 Hook: SingleRoIExtractor (捕获 RPN Proposals rois_x 与 Top-5 候选框)
-        # ------------------------------------------------------------------
-        def _hook_layer4_roi_extractor(module: Any, inputs: Any, output: Any) -> None:
-            if len(inputs) >= 2 and torch.is_tensor(inputs[1]):
-                rois = inputs[1].detach().float().cpu()
-                self.frame_buffer["layer4_roi_extractor_calls"].append({
-                    "num_rois": int(rois.shape[0]),
-                    "rois_xyxy_scaled": rois[:, 1:5].numpy(),
-                    "out_feat_l2": self._l2_spatial_map(output) if torch.is_tensor(output) else None,
+        def _hook_neck(module: Any, inputs: Any, output: Any) -> None:
+            if isinstance(output, (tuple, list)):
+                self.frame_buffer["layer2_fpn_levels"] = [
+                    {"level_index": i, "level_name": f"P{i + 2}", "stride": 2 ** (i + 2), "shape": list(f.shape),
+                     "l2_map": self._l2_spatial_map(f)}
+                    for i, f in enumerate(output) if torch.is_tensor(f)
+                ]
+
+        self.handles.append(m.neck.register_forward_hook(_hook_neck))
+
+        # Layer 3A：RPN_Similarity_Learning.forward 是 generator —— 只挂 proj_out[k] 子模块，绝不调用/消费 generator
+        for lvl_idx, conv_mod in enumerate(m.rpn_similarity_learning.proj_out):
+            def _make_hook(k: int):
+                def _hook(module: Any, inputs: Any, output: Any) -> None:
+                    if torch.is_tensor(output):
+                        self.frame_buffer["layer3a_call_count"] += 1
+                        self.frame_buffer["layer3a_rpn_modulation_levels"][k] = {
+                            "level_name": f"P{k + 2}",
+                            "shape": list(output.shape),
+                            "l2_map": self._l2_spatial_map(output),
+                            "abs_mean": float(output.detach().float().abs().mean().item()),
+                        }
+                return _hook
+            self.handles.append(conv_mod.register_forward_hook(_make_hook(lvl_idx)))
+
+        use_sigmoid = bool(getattr(m.rpn_head, "use_sigmoid_cls", False))
+
+        def _hook_rpn_head(module: Any, inputs: Any, output: Any) -> None:
+            if isinstance(output, (tuple, list)) and len(output) == 2:
+                maps = []
+                for i, sc in enumerate(output[0]):
+                    if torch.is_tensor(sc):
+                        maps.append({
+                            "level_name": f"P{i + 2}",
+                            "shape": list(sc.shape),
+                            # 仅当 rpn_head.use_sigmoid_cls=True 时 sigmoid 才与 get_bboxes 的打分方式一致；否则写 null
+                            "objectness_max_over_anchors": (
+                                torch.sigmoid(sc.detach().float()[0]).max(dim=0)[0].cpu().numpy() if use_sigmoid else None
+                            ),
+                        })
+                self.frame_buffer["rpn_objectness_maps"] = maps
+
+        self.handles.append(m.rpn_head.register_forward_hook(_hook_rpn_head))
+
+        # Layer 3B：Stage-2 RCNN_Similarity_Learning.proj_out（输出即 proj_out(proj_x(x) * proj_z(z))）
+        def _hook_rcnn_sim(module: Any, inputs: Any, output: Any) -> None:
+            if torch.is_tensor(output):
+                o = output.detach().float()
+                self.frame_buffer["layer3b_rcnn_similarity_calls"].append({
+                    "phase": self._phase,
+                    "bg_call_index": len(self.frame_buffer["bg_matching_calls"]) if self._phase == "bg_matching" else None,
+                    "out_shape": list(o.shape),
+                    "per_roi_l2_energy": torch.norm(o.reshape(o.shape[0], -1), p=2, dim=1).cpu().tolist() if o.dim() >= 2 else [],
                 })
 
-        self.handles.append(
-            self.model.roi_head.bbox_roi_extractor.register_forward_hook(_hook_layer4_roi_extractor)
-        )
+        self.handles.append(m.rcnn_similarity_learning.proj_out.register_forward_hook(_hook_rcnn_sim))
 
-        # ------------------------------------------------------------------
-        # Layer 5 Hook: Shared2FCBBoxHead (捕获 Tracking / Detection 分支与 11 路背景抑制得分)
-        # ------------------------------------------------------------------
-        def _hook_layer5_bbox_head(module: Any, inputs: Any, output: Any) -> None:
-            if isinstance(output, (tuple, list)) and len(output) >= 2:
-                cls_score, bbox_pred = output[0], output[1]
-                if torch.is_tensor(cls_score):
-                    probs = torch.softmax(cls_score.detach().float(), dim=-1)[:, 0].cpu().numpy()
-                    self.frame_buffer["layer5_bbox_head_calls"].append({
-                        "num_Candidates": int(cls_score.shape[0]),
-                        "fg_probs": probs,
-                        "bbox_pred": bbox_pred.detach().float().cpu().numpy()
-                        if torch.is_tensor(bbox_pred)
-                        else None,
-                    })
+    # ------------------------------------------------------------------
+    def _install_wrappers(self) -> None:
+        m = self.model
+        orig_pg = m._process_gallary
+        orig_stb = m.simple_test_bboxes
+        orig_sm = m.simple_matching
+        orig_uq = m._update_query
+        hm = self
 
-        self.handles.append(
-            self.model.roi_head.bbox_head.register_forward_hook(_hook_layer5_bbox_head)
-        )
+        def pg_wrapper(img_x: Any, img_meta_x: Any, **kwargs: Any) -> Any:
+            buf = hm.frame_buffer
+            buf["process_gallary_calls"] += 1
+            meta0 = img_meta_x[0] if isinstance(img_meta_x, (list, tuple)) and img_meta_x else {}
+            buf["img_meta_x"] = {
+                "img_shape": list(meta0.get("img_shape", []) or []),
+                "ori_shape": list(meta0.get("ori_shape", []) or []),
+                "scale_factor_raw": _to_py(meta0.get("scale_factor")),
+            }
+            lr = getattr(m, "_learning_rate", None)
+            buf["learning_rate"] = float(lr) if lr is not None else None
+            out = orig_pg(img_x, img_meta_x, **kwargs)
+            results, up_flag = out
+            arr = results.tolist() if hasattr(results, "tolist") else _to_py(results)
+            buf["final_results"] = [list(r[:5]) for r in arr]
+            buf["up_flag"] = bool(up_flag)
+            return out
 
-        # ------------------------------------------------------------------
-        # Layer 6 Hook: RCNN_Similarity_Learning (捕获动态模板 z 与 11 路背景模板互相关激活)
-        # ------------------------------------------------------------------
-        if hasattr(self.model, "rcnn_similarity_learning"):
-            def _hook_layer6_rcnn_sim(module: Any, inputs: Any, output: Any) -> None:
-                if len(inputs) >= 2 and torch.is_tensor(inputs[0]) and torch.is_tensor(inputs[1]):
-                    z_in = inputs[0].detach().float()
-                    x_in = inputs[1].detach().float()
-                    out_t = output.detach().float() if torch.is_tensor(output) else None
-                    self.frame_buffer["layer6_rcnn_sim_calls"].append({
-                        "z_shape": list(z_in.shape),
-                        "x_shape": list(x_in.shape),
-                        "out_shape": list(out_t.shape) if out_t is not None else [],
-                        "out_mean_energy": float(torch.norm(out_t, p=2, dim=1).mean().item())
-                        if out_t is not None
-                        else 0.0,
-                        "out_per_item_energy": torch.norm(out_t, p=2, dim=(1, 2, 3)).cpu().numpy().tolist()
-                        if out_t is not None and out_t.dim() == 4
-                        else [],
-                    })
+        def stb_wrapper(*args: Any, **kwargs: Any) -> Any:
+            buf = hm.frame_buffer
+            proposals = args[3] if len(args) > 3 else kwargs.get("proposals")
+            if proposals is not None and len(proposals) > 0:
+                buf["rpn_proposals_net"] = _to_py(proposals[0])
+            buf["simple_test_bboxes_rescale"] = bool(kwargs.get("rescale", False))
+            prev = hm._phase
+            hm._phase = "rcnn_main"
+            try:
+                out = orig_stb(*args, **kwargs)
+            finally:
+                hm._phase = prev
+            tra_b, _tra_l, det_b, _det_l = out
+            buf["tra_bboxes"] = _to_py(tra_b)
+            buf["det_bboxes"] = _to_py(det_b)
+            return out
 
-            self.handles.append(
-                self.model.rcnn_similarity_learning.register_forward_hook(_hook_layer6_rcnn_sim)
-            )
+        def sm_wrapper(*args: Any, **kwargs: Any) -> Any:
+            buf = hm.frame_buffer
+            rois_bg = args[2] if len(args) > 2 else kwargs.get("rois_x")
+            prev = hm._phase
+            hm._phase = "bg_matching"
+            try:
+                out = orig_sm(*args, **kwargs)
+            finally:
+                hm._phase = prev
+            match_bboxes = out[0]
+            scores = _to_py(match_bboxes[:, -1]) if hasattr(match_bboxes, "shape") and match_bboxes.shape[0] > 0 else []
+            buf["bg_matching_calls"].append({
+                "call_index": len(buf["bg_matching_calls"]),
+                "num_bg_rois": int(rois_bg.shape[0]) if hasattr(rois_bg, "shape") else None,
+                "num_returned": len(scores),
+                "scores": scores,
+                "max_score": max(scores) if scores else None,
+            })
+            return out
+
+        def uq_wrapper(*args: Any, **kwargs: Any) -> Any:
+            import torch
+            buf = hm.frame_buffer
+            gt_bboxes_z = args[2] if len(args) > 2 else kwargs.get("gt_bboxes_z")
+            z_before = m._bbox_feats_z.detach().float().clone() if torch.is_tensor(getattr(m, "_bbox_feats_z", None)) else None
+            out = orig_uq(*args, **kwargs)
+            z_after = m._bbox_feats_z.detach().float() if torch.is_tensor(getattr(m, "_bbox_feats_z", None)) else None
+            box_net = None
+            try:
+                box_net = [float(v) for v in _to_py(gt_bboxes_z[0])[0][:4]]
+            except Exception:
+                box_net = None
+            buf["update_query_calls"].append({
+                "update_box_net_xyxy": box_net,
+                "learning_rate": float(getattr(m, "_learning_rate", float("nan"))),
+                "template_delta_l2": float(torch.norm(z_after - z_before).item()) if (z_before is not None and z_after is not None) else None,
+                "bg_bank_size_after": int(m._bbox_feats_bg.shape[0]) if torch.is_tensor(getattr(m, "_bbox_feats_bg", None)) else None,
+            })
+            hm.cumulative_update_count += 1
+            return out
+
+        m.__dict__["_process_gallary"] = pg_wrapper
+        m.__dict__["simple_test_bboxes"] = stb_wrapper
+        m.__dict__["simple_matching"] = sm_wrapper
+        m.__dict__["_update_query"] = uq_wrapper
 
     def snapshot_initial_template(self) -> None:
-        if hasattr(self.model, "_bbox_feats_z") and self.model._bbox_feats_z is not None:
-            self.initial_template_feat = self.model._bbox_feats_z.detach().float().clone()
+        z = getattr(self.model, "_bbox_feats_z", None)
+        if z is not None:
+            self.initial_template_feat = z.detach().float().clone()
 
     def remove_hooks(self) -> None:
         for h in self.handles:
@@ -456,477 +685,169 @@ class SiamDT6LayerHookManager:
             except Exception:
                 pass
         self.handles.clear()
+        for name in self.WRAPPED_METHODS:
+            self.model.__dict__.pop(name, None)
 
 
 # ==============================================================================
-# 3. 六层解剖数据整合与根因判定器
+# 4. 从捕获缓冲区构建单帧记录（真实值 + 明确标注的派生量）
 # ==============================================================================
 
-def diagnose_primary_bottleneck(layer_metrics: Dict[str, Any]) -> Dict[str, str]:
-    """根据 6 层量化指标自动给出当前帧的故障根因归因标签与中文诊断结论。"""
-    l1_ratio = float(layer_metrics["layer1_backbone"]["mean_target_to_bg_ratio"])
-    l2_p2_ratio = float(layer_metrics["layer2_fpn"]["per_level"].get("P2", {}).get("target_to_bg_activation_ratio", 1.0))
-    l2_p4_ratio = float(layer_metrics["layer2_fpn"]["per_level"].get("P4", {}).get("target_to_bg_activation_ratio", 1.0))
-    l3_margin = float(layer_metrics["layer3_ds_rpn"]["xcorr_combined"]["target_vs_strongest_distractor_margin"])
-    rpn_iou = float(layer_metrics["layer4_rpn_proposals"]["rpn_recall_iou"])
-    best_rank = int(layer_metrics["layer5_rcnn_top5"]["rcnn_rank_of_best_iou_proposal"])
-    rank1_iou = float(layer_metrics["layer5_rcnn_top5"]["top1_iou"])
-    best_top5_iou = float(layer_metrics["layer5_rcnn_top5"]["best_top5_iou"])
-    polluted = bool(layer_metrics["layer6_dyn_template_bg_supp"]["template_pollution_triggered"])
+def build_layer5_and_6_records(buf: Dict[str, Any], gt_xywh: List[float], exist_f: int) -> Dict[str, Any]:
+    """纯 Python：Layer 4/5/6 的真实值整理与派生指标（可脱离 torch 单测）。"""
+    gt_xyxy = xywh_to_xyxy(gt_xywh)
+    gt_valid = exist_f == 1 and gt_xywh[2] > 0 and gt_xywh[3] > 0
+    meta = buf.get("img_meta_x") or {}
+    sf4 = normalize_scale_factor(meta.get("scale_factor_raw"))
+    tra = buf.get("tra_bboxes") or []
+    det = buf.get("det_bboxes") or []
+    final_rows = buf.get("final_results") or []
 
-    if polluted:
-        return {
-            "primary_bottleneck_layer": "Layer 6 (Dynamic Template Pollution)",
-            "verdict_code": "L6_TEMPLATE_POLLUTION",
-            "summary_zh": f"第 6 层动态模板发生污染：在真实 IoU={rank1_iou:.3f} (<0.3) 时错误触发了模板更新，导致后续匹配基准漂移。",
-        }
-    if rpn_iou < 0.30:
-        if l3_margin < -0.05:
-            return {
-                "primary_bottleneck_layer": "Layer 3 (DS-RPN Cross-Correlation Distractor Hijack)",
-                "verdict_code": "L3_DS_RPN_DISTRACTOR_PEAK",
-                "summary_zh": f"第 3 层 DS-RPN 互相关响应被强热背景干扰物劫持 (Margin={l3_margin:+.3f})，导致第 4 层 RPN Top-64 最大 IoU 仅为 {rpn_iou:.3f}。",
-            }
-        if l2_p4_ratio < 0.85 and l2_p2_ratio > 1.15:
-            return {
-                "primary_bottleneck_layer": "Layer 2 (FPN Deep Stride Attenuation P4~P6)",
-                "verdict_code": "L2_FPN_HIGH_STRIDE_LOSS",
-                "summary_zh": f"第 2 层 FPN 下采样特征衰减：P2 浅层仍有激活 (Ratio={l2_p2_ratio:.2f})，但 P4~P6 深层被背景淹没 (Ratio={l2_p4_ratio:.2f})，致使 RPN 漏检 (max IoU={rpn_iou:.3f})。",
-            }
-        return {
-            "primary_bottleneck_layer": "Layer 4 (Stage-1 RPN Proposal Recall Miss)",
-            "verdict_code": "L4_RPN_PROPOSAL_MISS",
-            "summary_zh": f"第 4 层 RPN 候选框召回失败：Top-64 候选框最大 IoU 仅为 {rpn_iou:.3f} (<0.30)，目标在第一阶段即漏检（Backbone Ratio={l1_ratio:.2f}）。",
-        }
-    if best_top5_iou >= 0.45 and best_rank > 1 and rank1_iou < 0.25:
-        return {
-            "primary_bottleneck_layer": "Layer 5 & 6 (Versatile R-CNN Rank Inversion / BG Suppression Failure)",
-            "verdict_code": "L5_RCNN_RANK_INVERSION",
-            "summary_zh": f"第 5/6 层决赛圈排序倒挂：真目标已在候选池中（第 {best_rank} 名，IoU={best_top5_iou:.3f}），但背景干扰物排在第 1 名（IoU={rank1_iou:.3f}），11 路背景抑制未能压制伪峰。",
-        }
-    if rank1_iou < 0.50:
-        return {
-            "primary_bottleneck_layer": "Layer 5 (R-CNN Box Regression & Localization Drift)",
-            "verdict_code": "L5_LOCALIZATION_DRIFT",
-            "summary_zh": f"第 5 层边界框回归漂移：RPN 召回 IoU={rpn_iou:.3f}，最终 Top-1 输出 IoU={rank1_iou:.3f}。",
-        }
-    return {
-        "primary_bottleneck_layer": "NORMAL (All 6 Layers Healthy)",
-        "verdict_code": "HEALTHY_TRACKING",
-        "summary_zh": f"六层特征链路正常：RPN Top-64 最大 IoU={rpn_iou:.3f}，R-CNN Top-1 命中真目标 (IoU={rank1_iou:.3f}, Rank=#{best_rank})。",
+    # ---------------- Layer 4：RPN 候选（网络尺度 -> 原图） ----------------
+    props_net = buf.get("rpn_proposals_net") or []
+    props_orig = boxes_net_to_orig(props_net, sf4)
+    l4: Dict[str, Any] = {
+        "num_proposals": len(props_net),
+        "scale_factor": sf4,
+        "coordinate_note": "proposals 来自 simple_test_bboxes 入参（网络输入尺度），已除以 scale_factor 还原原图；scale_factor 无法识别时坐标写 null",
+        "proposals_orig_xyxy_top64": [[round(v, 3) for v in p[:5]] for p in props_orig[:64]] if props_orig else None,
+        "rpn_top64_max_iou": None, "rpn_all_max_iou": None, "rpn_top64_hits_iou_05": None,
+        "provenance": {"boxes": PROV_CAPTURED, "ious": PROV_DERIVED},
+    }
+    if props_orig and gt_valid:
+        ious = [compute_iou_xyxy(p, gt_xyxy) for p in props_orig]
+        l4["rpn_all_max_iou"] = round(max(ious), 6)
+        l4["rpn_top64_max_iou"] = round(max(ious[:64]), 6)
+        l4["rpn_top64_hits_iou_05"] = int(sum(1 for v in ious[:64] if v >= 0.5))
+
+    # ---------------- Layer 5：源码决赛圈 Top-5（真实值） ----------------
+    prov = match_candidate_provenance(final_rows, tra, det)
+    bg_calls = buf.get("bg_matching_calls") or []
+    penalties = [c.get("max_score") for c in bg_calls] if len(bg_calls) == len(final_rows) else None
+    cands = decompose_candidate_scores(final_rows, prov, penalties)
+    selected_idx = max(range(len(final_rows)), key=lambda i: float(final_rows[i][4])) if final_rows else None
+    for i, c in enumerate(cands):
+        c["selected_by_tracker"] = (i == selected_idx)
+        c["gt_iou"] = round(compute_iou_xyxy(c["bbox_xyxy"], gt_xyxy), 6) if gt_valid else None
+        c["bg_matching_num_bg_rois"] = bg_calls[i].get("num_bg_rois") if i < len(bg_calls) else None
+    order_final = sorted(range(len(cands)), key=lambda i: -float(cands[i]["final_score"])) if cands else []
+    for r, i in enumerate(order_final, start=1):
+        cands[i]["rank_by_final_score"] = r
+
+    def _top5(rows: List[List[float]]) -> List[Dict[str, Any]]:
+        srt = sorted(rows, key=lambda r: -float(r[4]))[:5]
+        return [{"bbox_xyxy": [round(float(v), 3) for v in r[:4]], "score": float(r[4]),
+                 "gt_iou": round(compute_iou_xyxy(r, gt_xyxy), 6) if gt_valid else None} for r in srt]
+
+    best_iou_rank_final = None
+    best_iou = None
+    selected_iou = None
+    if cands and gt_valid:
+        best_i = max(range(len(cands)), key=lambda i: cands[i]["gt_iou"])
+        best_iou = cands[best_i]["gt_iou"]
+        best_iou_rank_final = cands[best_i]["rank_by_final_score"]
+        selected_iou = cands[selected_idx]["gt_iou"] if selected_idx is not None else None
+
+    no_partner_rows = rows_without_iou_reward_partner(final_rows)
+    identity_checks = []
+    for i in no_partner_rows:
+        c = cands[i]
+        if c["post_bg_score"] is not None and c["final_score"] is not None:
+            identity_checks.append(abs(c["final_score"] - c["post_bg_score"]) <= 1e-4)
+    l5 = {
+        "source_semantics": "Top-5 = tra 与 det 拼接后按分数降序取前 5（siamdt_rcnn.py:452-460），非每分支各 5 个",
+        "top_num_source": SOURCE_TOP_NUM,
+        "num_candidates_captured": len(cands),
+        "num_bg_matching_calls": len(bg_calls),
+        "candidates": cands,
+        "branch_top5": {"similarity_tracking_branch(tra)": _top5(tra), "detection_branch(det)": _top5(det)},
+        "best_gt_iou_among_top5": best_iou,
+        "best_gt_iou_candidate_rank_by_final_score": best_iou_rank_final,
+        "selected_candidate_gt_iou": selected_iou,
+        "capture_consistency": {
+            "bg_matching_calls_equals_top_num": len(bg_calls) == len(final_rows) == SOURCE_TOP_NUM,
+            "all_candidates_provenance_matched": all(p["branch"] not in ("unmatched",) for p in prov) if prov else False,
+            "rows_without_iou_reward_partner": no_partner_rows,
+            "final_equals_pre_minus_penalty_on_those_rows": all(identity_checks) if identity_checks else None,
+            "simple_test_bboxes_rescale_flag": buf.get("simple_test_bboxes_rescale"),
+        },
+        "coordinate_note": "tra/det/最终框来自 rescale=True 的 get_bboxes，已是原图坐标（siamdt_tracking.py:77-78）",
     }
 
-
-# ==============================================================================
-# 4. 高清 6 层模块全景解剖大图绘制器 (Matplotlib 3x4 Grid Dashboard)
-# ==============================================================================
-
-def render_6layer_anatomy_figure(
-    frame_rgb: "np.ndarray",
-    frame_data: Dict[str, Any],
-    output_png_path: Path,
-) -> None:
-    """
-    绘制高清 6 层模块全景解剖大图 `6layer_anatomy_{seq_id}_frame_{frame_id:04d}.png`：
-    采用 3 行 x 4 列 (12 子图) 专业科研级排版，完整呈现原图与 Layer 1 ~ Layer 6 全链路特征与量化指标。
-    """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as patches
-    import numpy as np
-
-    # 配置中文字体兼容回退（兼容 Linux Colab 与 Windows 本地）
-    plt.rcParams["font.sans-serif"] = [
-        "Microsoft YaHei",
-        "SimHei",
-        "Noto Sans CJK SC",
-        "WenQuanYi Micro Hei",
-        "DejaVu Sans",
-    ]
-    plt.rcParams["axes.unicode_minus"] = False
-
-    seq_id = frame_data["seq_id"]
-    frame_id = frame_data["frame_id"]
-    phase_tag = frame_data.get("phase_tag", "Diagnostic Frame")
-    gt_xywh = frame_data["gt_bbox"]
-    pred_xywh = frame_data["pred_bbox"]
-    iou_val = frame_data["iou"]
-    conf_val = frame_data["confidence"]
-    up_flag = frame_data["template_updated"]
-    metrics = frame_data["metrics"]
-    maps = frame_data["visual_maps"]
-    verdict = metrics["root_cause_verdict"]
-
-    img_h, img_w = frame_rgb.shape[:2]
-
-    fig, axes = plt.subplots(3, 4, figsize=(24, 16.5), dpi=160)
-    fig.patch.set_facecolor("#0f172a")
-
-    title_color = "#f8fafc"
-    sub_bg = "#1e293b"
-    text_muted = "#cbd5e1"
-
-    banner_text = (
-        f"SiamDT 6-Layer Module Feature Anatomy | Seq: {seq_id} | Frame: #{frame_id:04d} ({phase_tag})\n"
-        f"GT vs Pred IoU = {iou_val:.3f} | Confidence = {conf_val:.3f} | Template Updated = {up_flag} | "
-        f"Bottleneck: [{verdict['verdict_code']}] {verdict['summary_zh']}"
-    )
-    fig.suptitle(banner_text, fontsize=13.5, fontweight="bold", color=title_color, y=0.985)
-
-    def _style_ax(ax: Any, title: str) -> None:
-        ax.set_facecolor(sub_bg)
-        ax.set_title(title, fontsize=10.5, fontweight="bold", color="#e2e8f0", pad=6)
-        ax.tick_params(colors=text_muted, labelsize=8)
-        for spine in ax.spines.values():
-            spine.set_edgecolor("#334155")
-
-    def _draw_gt_pred_boxes(ax: Any, scale_x: float = 1.0, scale_y: float = 1.0) -> None:
-        gx, gy, gw, gh = gt_xywh
-        px, py, pw, ph = pred_xywh
-        if gw > 0 and gh > 0:
-            rect_gt = patches.Rectangle(
-                (gx * scale_x, gy * scale_y),
-                gw * scale_x,
-                gh * scale_y,
-                linewidth=2.0,
-                edgecolor="#22c55e",
-                facecolor="none",
-                label="GT",
-            )
-            ax.add_patch(rect_gt)
-        if pw > 0 and ph > 0:
-            rect_pred = patches.Rectangle(
-                (px * scale_x, py * scale_y),
-                pw * scale_x,
-                ph * scale_y,
-                linewidth=2.0,
-                linestyle="--",
-                edgecolor="#ef4444",
-                facecolor="none",
-                label="Pred",
-            )
-            ax.add_patch(rect_pred)
-
-    # --------------------------------------------------------------------------
-    # Panel (0, 0): 原图 + GT/Pred + Target ROI 局部放大内嵌图
-    # --------------------------------------------------------------------------
-    ax00 = axes[0, 0]
-    ax00.imshow(frame_rgb)
-    _draw_gt_pred_boxes(ax00)
-    _style_ax(
-        ax00,
-        f"[Input] IR Frame #{frame_id:04d} ({phase_tag})\n"
-        f"Green=GT | Red=Pred (IoU={iou_val:.3f}, Conf={conf_val:.3f})",
-    )
-    ax00.legend(loc="upper right", fontsize=8, facecolor="#0f172a", edgecolor="#475569", labelcolor="white")
-
-    # --------------------------------------------------------------------------
-    # Panel (0, 1): Layer 1 - Swin-Tiny Backbone Stage 1 (C2, stride 4) & Stage 2 (C3)
-    # --------------------------------------------------------------------------
-    ax01 = axes[0, 1]
-    s1_map = maps["layer1_stage1_c2"]
-    im01 = ax01.imshow(s1_map, cmap="magma", extent=[0, img_w, img_h, 0])
-    _draw_gt_pred_boxes(ax01)
-    m_s1 = metrics["layer1_backbone"]["per_stage"].get("Stage1_C2", {})
-    _style_ax(
-        ax01,
-        f"[Layer 1A] Backbone Swin Stage-1 (C2, s=4) L2 Energy\n"
-        f"T/BG Ratio={m_s1.get('target_to_bg_activation_ratio', 0):.2f} | "
-        f"Margin={m_s1.get('target_vs_strongest_distractor_margin', 0):+.2f} | "
-        f"H={m_s1.get('response_entropy', 0):.2f}",
-    )
-    plt.colorbar(im01, ax=ax01, fraction=0.046, pad=0.04)
-
-    # --------------------------------------------------------------------------
-    # Panel (0, 2): Layer 1 - Swin-Tiny Backbone Stage 3 (C4) & Stage 4 (C5, stride 32)
-    # --------------------------------------------------------------------------
-    ax02 = axes[0, 2]
-    s4_map = maps["layer1_stage4_c5"]
-    im02 = ax02.imshow(s4_map, cmap="magma", extent=[0, img_w, img_h, 0])
-    _draw_gt_pred_boxes(ax02)
-    m_s4 = metrics["layer1_backbone"]["per_stage"].get("Stage4_C5", {})
-    _style_ax(
-        ax02,
-        f"[Layer 1B] Backbone Swin Stage-4 (C5, s=32) L2 Energy\n"
-        f"T/BG Ratio={m_s4.get('target_to_bg_activation_ratio', 0):.2f} | "
-        f"Margin={m_s4.get('target_vs_strongest_distractor_margin', 0):+.2f} | "
-        f"H={m_s4.get('response_entropy', 0):.2f}",
-    )
-    plt.colorbar(im02, ax=ax02, fraction=0.046, pad=0.04)
-
-    # --------------------------------------------------------------------------
-    # Panel (0, 3): Layer 2 - 5-Level FPN (P2~P6) 跨尺度能量衰减对比与热力图
-    # --------------------------------------------------------------------------
-    ax03 = axes[0, 3]
-    fpn_grid = maps["layer2_fpn_montage"]
-    im03 = ax03.imshow(fpn_grid, cmap="viridis", aspect="auto")
-    p_ratios = [
-        f"P{k}:{metrics['layer2_fpn']['per_level'].get(f'P{k}', {}).get('target_to_bg_activation_ratio', 0):.2f}"
-        for k in range(2, 7)
-    ]
-    _style_ax(
-        ax03,
-        f"[Layer 2] 5-Level FPN (P2|P3|P4|P5|P6) Multi-Scale Maps\n"
-        f"T/BG Ratios: {' | '.join(p_ratios)}",
-    )
-    ax03.set_xticks(
-        [int(fpn_grid.shape[1] * (i + 0.5) / 5.0) for i in range(5)],
-        ["P2 (s=4)", "P3 (s=8)", "P4 (s=16)", "P5 (s=32)", "P6 (s=64)"],
-        color="white",
-    )
-    ax03.set_yticks([])
-    plt.colorbar(im03, ax=ax03, fraction=0.046, pad=0.04)
-
-    # --------------------------------------------------------------------------
-    # Panel (1, 0): Layer 3A - DS-RPN 一阶互相关匹配响应图 (Cross-Correlation Map)
-    # --------------------------------------------------------------------------
-    ax10 = axes[1, 0]
-    xcorr_map = maps["layer3_xcorr_map"]
-    im10 = ax10.imshow(xcorr_map, cmap="jet", extent=[0, img_w, img_h, 0])
-    _draw_gt_pred_boxes(ax10)
-    m_xc = metrics["layer3_ds_rpn"]["xcorr_combined"]
-    _style_ax(
-        ax10,
-        f"[Layer 3A] DS-RPN 1st-Order Cross-Correlation Map\n"
-        f"T/BG={m_xc['target_to_bg_activation_ratio']:.2f} | "
-        f"Peak Margin={m_xc['target_vs_strongest_distractor_margin']:+.3f} | "
-        f"Entropy={m_xc['response_entropy']:.3f}",
-    )
-    plt.colorbar(im10, ax=ax10, fraction=0.046, pad=0.04)
-
-    # --------------------------------------------------------------------------
-    # Panel (1, 1): Layer 3B - DS-RPN 二阶格拉姆矩阵响应图 (2nd-Order Gram Matrix Map)
-    # --------------------------------------------------------------------------
-    ax11 = axes[1, 1]
-    gram_map = maps["layer3_gram_map"]
-    im11 = ax11.imshow(gram_map, cmap="plasma", extent=[0, img_w, img_h, 0])
-    _draw_gt_pred_boxes(ax11)
-    m_gr = metrics["layer3_ds_rpn"]["gram_matrix_combined"]
-    _style_ax(
-        ax11,
-        f"[Layer 3B] DS-RPN 2nd-Order Gram Matrix Response\n"
-        f"T/BG={m_gr['target_to_bg_activation_ratio']:.2f} | "
-        f"Peak Margin={m_gr['target_vs_strongest_distractor_margin']:+.3f} | "
-        f"Entropy={m_gr['response_entropy']:.3f}",
-    )
-    plt.colorbar(im11, ax=ax11, fraction=0.046, pad=0.04)
-
-    # --------------------------------------------------------------------------
-    # Panel (1, 2): Layer 4 - RPN Top-64 Proposals 空间分布热力与候选框叠加
-    # --------------------------------------------------------------------------
-    ax12 = axes[1, 2]
-    ax12.imshow(frame_rgb, alpha=0.55)
-    rpn_heat = maps["layer4_rpn_density_map"]
-    im12 = ax12.imshow(rpn_heat, cmap="hot", alpha=0.55, extent=[0, img_w, img_h, 0])
-    m_l4 = metrics["layer4_rpn_proposals"]
-    for prop in m_l4.get("top64_boxes_xyxy", [])[:25]:
-        px1, py1, px2, py2 = prop[:4]
-        ax12.add_patch(
-            patches.Rectangle(
-                (px1, py1),
-                max(1.0, px2 - px1),
-                max(1.0, py2 - py1),
-                linewidth=0.8,
-                edgecolor="#38bdf8",
-                facecolor="none",
-                alpha=0.65,
-            )
-        )
-    _draw_gt_pred_boxes(ax12)
-    _style_ax(
-        ax12,
-        f"[Layer 4] RPN Top-64 Proposals Spatial Density & Recall\n"
-        f"max IoU@64={m_l4['rpn_top64_max_iou']:.3f} | "
-        f"max IoU@1000={m_l4['rpn_top1000_max_iou']:.3f} | "
-        f"Hits(IoU>=0.5)={m_l4['rpn_hit_count_iou_05']}",
-    )
-    plt.colorbar(im12, ax=ax12, fraction=0.046, pad=0.04)
-
-    # --------------------------------------------------------------------------
-    # Panel (1, 3): Layer 5A - Versatile R-CNN Top-5 决赛圈候选框在原图上的空间竞争
-    # --------------------------------------------------------------------------
-    ax13 = axes[1, 3]
-    ax13.imshow(frame_rgb)
-    _draw_gt_pred_boxes(ax13)
-    m_l5 = metrics["layer5_rcnn_top5"]
-    palette_top5 = ["#ef4444", "#f97316", "#eab308", "#06b6d4", "#a855f7"]
-    for rank_idx, cand in enumerate(m_l5.get("top5_candidates", [])):
-        cx1, cy1, cx2, cy2 = cand["bbox_xyxy"]
-        c_color = palette_top5[rank_idx % len(palette_top5)]
-        ax13.add_patch(
-            patches.Rectangle(
-                (cx1, cy1),
-                max(2.0, cx2 - cx1),
-                max(2.0, cy2 - cy1),
-                linewidth=2.2 if rank_idx == 0 else 1.5,
-                edgecolor=c_color,
-                facecolor="none",
-            )
-        )
-        ax13.text(
-            cx1,
-            max(12.0, cy1 - 4.0),
-            f"#{rank_idx + 1} ({cand['branch'][:3]}): S={cand['final_score']:.2f}, IoU={cand['iou']:.2f}",
-            fontsize=7.5,
-            color="white",
-            bbox=dict(boxstyle="round,pad=0.18", facecolor=c_color, alpha=0.82, edgecolor="none"),
-        )
-    _style_ax(
-        ax13,
-        f"[Layer 5A] Versatile R-CNN Top-5 Spatial Competition\n"
-        f"Best-IoU Proposal Rank=#{m_l5['rcnn_rank_of_best_iou_proposal']} "
-        f"(Best IoU={m_l5['best_top5_iou']:.3f} vs Top1 IoU={m_l5['top1_iou']:.3f})",
-    )
-
-    # --------------------------------------------------------------------------
-    # Panel (2, 0): Layer 5B - Top-5 候选框置信度得分 vs 真实 GT IoU 条形图 (排序倒挂诊断)
-    # --------------------------------------------------------------------------
-    ax20 = axes[2, 0]
-    cands = m_l5.get("top5_candidates", [])
-    n_c = len(cands)
-    if n_c > 0:
-        x_pos = np.arange(n_c)
-        width = 0.36
-        final_scores = [c["final_score"] for c in cands]
-        true_ious = [c["iou"] for c in cands]
-        labels_x = [f"Rank #{i + 1}\n({c['branch']})" for i, c in enumerate(cands)]
-        b1 = ax20.bar(x_pos - width / 2, final_scores, width, label="Final Score (置信度)", color="#3b82f6")
-        b2 = ax20.bar(x_pos + width / 2, true_ious, width, label="True GT IoU (真实交并比)", color="#10b981")
-        ax20.set_xticks(x_pos, labels_x, color="white", fontsize=8.5)
-        ax20.axhline(0.5, color="#f59e0b", linestyle=":", linewidth=1.2, label="IoU=0.5 Threshold")
-        for bar in b1:
-            h = bar.get_height()
-            ax20.text(bar.get_x() + bar.get_width() / 2, h + 0.02, f"{h:.2f}", ha="center", va="bottom", color="#93c5fd", fontsize=7.5)
-        for bar in b2:
-            h = bar.get_height()
-            ax20.text(bar.get_x() + bar.get_width() / 2, h + 0.02, f"{h:.2f}", ha="center", va="bottom", color="#6ee7b7", fontsize=7.5)
-        ax20.set_ylim(min(-0.2, min(final_scores) - 0.1), max(1.25, max(final_scores + true_ious) + 0.18))
-        ax20.legend(loc="upper right", fontsize=8, facecolor="#0f172a", edgecolor="#475569", labelcolor="white")
-    inv_flag = "YES (排序倒挂!)" if m_l5.get("rank_inversion_detected") else "NO (排序正常)"
-    _style_ax(
-        ax20,
-        f"[Layer 5B] Top-5 Confidence Score vs True GT IoU\n"
-        f"Rank Inversion: {inv_flag} | Best IoU Rank=#{m_l5['rcnn_rank_of_best_iou_proposal']}",
-    )
-
-    # --------------------------------------------------------------------------
-    # Panel (2, 1): Layer 6A - 动态模板特征 z_dyn_feat (7x7) vs 初始模板 & 11 路背景模板
-    # --------------------------------------------------------------------------
-    ax21 = axes[2, 1]
-    tmpl_panel = maps["layer6_template_comparison_map"]
-    im21 = ax21.imshow(tmpl_panel, cmap="inferno", aspect="auto")
-    m_l6 = metrics["layer6_dyn_template_bg_supp"]
-    _style_ax(
-        ax21,
-        f"[Layer 6A] Dynamic Template z_dyn (7x7) vs z_init & 11-BG Bank\n"
-        f"CosSim(z_t, z_0)={m_l6['template_cosine_sim_to_init']:.3f} | "
-        f"Drift={m_l6['template_l2_drift_ratio']:.3f} | "
-        f"Polluted={m_l6['template_pollution_triggered']}",
-    )
-    ax21.set_xticks(
-        [3.5, 11.5, 19.5],
-        ["z_init (Frame 0)", "z_dyn (Current)", "11-Way BG Mean"],
-        color="white",
-        fontsize=8.5,
-    )
-    ax21.set_yticks([])
-    plt.colorbar(im21, ax=ax21, fraction=0.046, pad=0.04)
-
-    # --------------------------------------------------------------------------
-    # Panel (2, 2): Layer 6B - 11 路背景抑制 (11-way Ensemble BG Suppression) 前后得分对比
-    # --------------------------------------------------------------------------
-    ax22 = axes[2, 2]
-    if n_c > 0:
-        x_pos = np.arange(n_c)
-        w = 0.26
-        pre_s = [c["pre_bg_supp_score"] for c in cands]
-        bg_pen = [c["bg_supp_penalty_max"] for c in cands]
-        post_s = [c["final_score"] for c in cands]
-        ax22.bar(x_pos - w, pre_s, w, label="Pre-Suppression (抑制前)", color="#60a5fa")
-        ax22.bar(x_pos, bg_pen, w, label="11-Way BG Penalty (背景惩罚)", color="#f43f5e")
-        ax22.bar(x_pos + w, post_s, w, label="Post-Suppression (最终得分)", color="#a855f7")
-        ax22.set_xticks(x_pos, [f"Top #{i + 1}\n(IoU={c['iou']:.2f})" for i, c in enumerate(cands)], color="white", fontsize=8)
-        ax22.legend(loc="upper right", fontsize=7.5, facecolor="#0f172a", edgecolor="#475569", labelcolor="white")
-    _style_ax(
-        ax22,
-        f"[Layer 6B] 11-Way Ensemble BG Suppression Before vs After\n"
-        f"Mean BG Penalty={m_l6['mean_bg_suppression_penalty']:.3f} | "
-        f"Template Updated={up_flag}",
-    )
-
-    # --------------------------------------------------------------------------
-    # Panel (2, 3): 全链路 6 层量化体检雷达/汇总表与诊断结论卡
-    # --------------------------------------------------------------------------
-    ax23 = axes[2, 3]
-    ax23.axis("off")
-    _style_ax(ax23, "[6-Layer Quantitative Scorecard & Root-Cause Verdict]")
-    summary_lines = [
-        f"Sequence : {seq_id}  |  Frame : #{frame_id:04d} ({phase_tag})",
-        f"Pred IoU : {iou_val:.4f}  |  Confidence : {conf_val:.4f}  |  Updated : {up_flag}",
-        "-" * 58,
-        f"L1 Backbone (C2~C5)  : Mean T/BG Ratio = {metrics['layer1_backbone']['mean_target_to_bg_ratio']:.3f}",
-        f"                       Mean Margin     = {metrics['layer1_backbone']['mean_distractor_margin']:+.3f}",
-        f"L2 FPN (P2~P6)       : P2 T/BG={metrics['layer2_fpn']['per_level'].get('P2',{}).get('target_to_bg_activation_ratio',0):.2f} | "
-        f"P3={metrics['layer2_fpn']['per_level'].get('P3',{}).get('target_to_bg_activation_ratio',0):.2f} | "
-        f"P4={metrics['layer2_fpn']['per_level'].get('P4',{}).get('target_to_bg_activation_ratio',0):.2f}",
-        f"L3 DS-RPN Response   : XCorr T/BG={m_xc['target_to_bg_activation_ratio']:.2f}, Margin={m_xc['target_vs_strongest_distractor_margin']:+.3f}",
-        f"                       Gram  T/BG={m_gr['target_to_bg_activation_ratio']:.2f}, Entropy={m_gr['response_entropy']:.3f}",
-        f"L4 RPN Top-64 Recall : max IoU@64 = {m_l4['rpn_top64_max_iou']:.3f} | max IoU@1000 = {m_l4['rpn_top1000_max_iou']:.3f}",
-        f"L5 R-CNN Competition : Best-IoU Rank = #{m_l5['rcnn_rank_of_best_iou_proposal']} | Inversion = {m_l5['rank_inversion_detected']}",
-        f"L6 Dynamic Template  : CosSim={m_l6['template_cosine_sim_to_init']:.3f} | Pollution={m_l6['template_pollution_triggered']}",
-        "-" * 58,
-        f"Primary Bottleneck   : {verdict['primary_bottleneck_layer']}",
-        f"Verdict Code         : {verdict['verdict_code']}",
-    ]
-    card_text = "\n".join(summary_lines)
-    ax23.text(
-        0.03,
-        0.95,
-        card_text,
-        transform=ax23.transAxes,
-        va="top",
-        ha="left",
-        fontsize=8.8,
-        family="monospace",
-        color="#f1f5f9",
-        bbox=dict(boxstyle="round,pad=0.5", facecolor="#0f172a", edgecolor="#38bdf8", linewidth=1.5),
-    )
-    ax23.text(
-        0.03,
-        0.06,
-        f"诊断结论: {verdict['summary_zh']}",
-        transform=ax23.transAxes,
-        va="bottom",
-        ha="left",
-        fontsize=9.0,
-        fontweight="bold",
-        color="#fde047",
-        wrap=True,
-    )
-
-    plt.tight_layout(rect=[0, 0.01, 1, 0.955])
-    output_png_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(str(output_png_path), facecolor=fig.get_facecolor(), bbox_inches="tight")
-    plt.close(fig)
+    # ---------------- Layer 6：模板更新审计（源码条件 + 运行时 lr） ----------------
+    cond = source_update_condition(tra, det)
+    up_flag = buf.get("up_flag")
+    uq_calls = buf.get("update_query_calls") or []
+    upd_box_orig = None
+    upd_box_gt_iou = None
+    if uq_calls and uq_calls[-1].get("update_box_net_xyxy") is not None:
+        conv = boxes_net_to_orig([uq_calls[-1]["update_box_net_xyxy"]], sf4)
+        upd_box_orig = [round(v, 3) for v in conv[0][:4]] if conv else None
+        if upd_box_orig is not None and gt_valid:
+            upd_box_gt_iou = round(compute_iou_xyxy(upd_box_orig, gt_xyxy), 6)
+    l6 = {
+        "template_updated": up_flag,
+        "update_query_called": bool(uq_calls),
+        "learning_rate": buf.get("learning_rate"),
+        "ema_rule_source": "_bbox_feats_z = (1 - lr) * _bbox_feats_z + lr * new  (siamdt_rcnn.py:402)",
+        "bg_bank_refreshed_on_update": "update 时 _bbox_feats_bg 整体替换为新的 <=11 个背景 ROI（siamdt_rcnn.py:410-426）",
+        "source_update_condition": cond,
+        "source_condition_consistent_with_up_flag": (bool(cond["condition_met"]) == bool(up_flag)) if (cond is not None and up_flag is not None) else None,
+        "update_box_orig_xyxy": upd_box_orig,
+        "update_box_gt_iou": upd_box_gt_iou,
+        "posthoc_suspicious_update": (bool(up_flag) and upd_box_gt_iou is not None and upd_box_gt_iou < ANALYST_UPDATE_GT_IOU_THR) if up_flag else False,
+        "posthoc_suspicious_update_rule": f"分析者阈值：更新框与 GT 的 IoU < {ANALYST_UPDATE_GT_IOU_THR}（非模型行为，模型推理时看不到 GT）",
+        "template_delta_l2_this_frame": uq_calls[-1].get("template_delta_l2") if uq_calls else None,
+        "bg_bank_size_after_update": uq_calls[-1].get("bg_bank_size_after") if uq_calls else None,
+    }
+    return {"layer4_rpn_proposals": l4, "layer5_rcnn_top5": l5, "layer6_template_update_audit": l6}
 
 
-# ==============================================================================
-# 5. 从 Hook 缓冲区构建单帧 6 层量化指标与可视化特征图
-# ==============================================================================
+def diagnose_primary_bottleneck(layers: Dict[str, Any]) -> Dict[str, Any]:
+    """【分析者启发式标签，非模型输出】依据真实捕获量给出诊断标签；缺失字段时返回 INSUFFICIENT_DATA。"""
+    l4 = layers.get("layer4_rpn_proposals", {})
+    l5 = layers.get("layer5_rcnn_top5", {})
+    l6 = layers.get("layer6_template_update_audit", {})
+    l3 = layers.get("layer3a_rpn_modulation", {}).get("combined", {})
+    rpn_all = l4.get("rpn_all_max_iou")
+    best = l5.get("best_gt_iou_among_top5")
+    sel = l5.get("selected_candidate_gt_iou")
+    best_rank = l5.get("best_gt_iou_candidate_rank_by_final_score")
+    base = {"provenance": PROV_ANALYST}
+    if l6.get("posthoc_suspicious_update"):
+        return {**base, "verdict_code": "L6_SUSPICIOUS_TEMPLATE_UPDATE",
+                "summary_zh": f"源码条件触发了模板更新，但更新框与 GT 的 IoU={l6.get('update_box_gt_iou')}（< 分析者阈值 {ANALYST_UPDATE_GT_IOU_THR}），疑似把非目标写入模板。"}
+    if rpn_all is None or best is None or sel is None:
+        return {**base, "verdict_code": "INSUFFICIENT_DATA", "summary_zh": "GT 不可用（目标消失/无效）或捕获字段缺失，不给出诊断。"}
+    if rpn_all < ANALYST_RPN_MISS_IOU:
+        margin = l3.get("target_vs_strongest_distractor_margin")
+        hint = f"；RPN 调制响应（派生）峰值裕度={margin}" if margin is not None else ""
+        return {**base, "verdict_code": "L4_RPN_PROPOSAL_MISS",
+                "summary_zh": f"全部 RPN 候选与 GT 的最大 IoU={rpn_all:.3f} (< {ANALYST_RPN_MISS_IOU})，目标在第一阶段即未被召回{hint}。"}
+    if best < ANALYST_RPN_MISS_IOU:
+        return {**base, "verdict_code": "L5_TARGET_NOT_IN_TOP5",
+                "summary_zh": f"RPN 已召回目标（max IoU={rpn_all:.3f}），但源码决赛圈 Top-5 中最大 IoU 仅 {best:.3f}，目标未进入背景抑制环节。"}
+    if best >= ANALYST_RANK_INV_BEST_IOU and sel < ANALYST_RANK_INV_SELECTED_IOU and best_rank and best_rank > 1:
+        cands = l5.get("candidates", [])
+        sel_c = next((c for c in cands if c.get("selected_by_tracker")), None)
+        best_c = max(cands, key=lambda c: c.get("gt_iou") or -1.0) if cands else None
+        cause = "unknown"
+        if sel_c and best_c and None not in (sel_c.get("pre_bg_supp_score"), best_c.get("pre_bg_supp_score"), sel_c.get("bg_penalty"), best_c.get("bg_penalty")):
+            if best_c["pre_bg_supp_score"] >= sel_c["pre_bg_supp_score"]:
+                cause = "background_suppression_or_iou_reward_reversed_order"
+            else:
+                cause = "rcnn_raw_score_already_lower"
+        return {**base, "verdict_code": "L5_RANK_INVERSION", "inversion_cause": cause,
+                "summary_zh": f"真目标在 Top-5 中（IoU={best:.3f}，按最终得分排第 {best_rank}），但被选中的框 IoU={sel:.3f}；原因判别（真实分数对比）：{cause}。"}
+    if sel < 0.5:
+        return {**base, "verdict_code": "L5_LOCALIZATION_DRIFT", "summary_zh": f"被选中框 IoU={sel:.3f}（Top-5 最佳 {best:.3f}）。"}
+    return {**base, "verdict_code": "HEALTHY_TRACKING", "summary_zh": f"被选中框 IoU={sel:.3f}，RPN 召回 IoU={rpn_all:.3f}。"}
+
 
 def build_frame_anatomy_from_hook_buffer(
-    seq_id: str,
-    frame_id: int,
-    phase_tag: str,
-    img_rgb: "np.ndarray",
-    gt_xywh: List[float],
-    pred_xywh: List[float],
-    iou_val: float,
-    conf_val: float,
-    up_flag: bool,
+    seq_id: str, frame_id: int, phase_tag: str, img_rgb: Any, gt_xywh: List[float], exist_f: int,
+    pred_xywh: List[float], iou_val: Optional[float], conf_val: float, up_flag: bool,
     hook_mgr: SiamDT6LayerHookManager,
-    scale_factor: Any,
 ) -> Dict[str, Any]:
     import cv2
     import numpy as np
@@ -936,604 +857,705 @@ def build_frame_anatomy_from_hook_buffer(
     img_h, img_w = img_rgb.shape[:2]
     buf = hook_mgr.frame_buffer
     model = hook_mgr.model
+    gt_for_maps = gt_xywh if exist_f == 1 else [0.0, 0.0, 0.0, 0.0]
 
-    def _resize_to_img(m: "np.ndarray") -> "np.ndarray":
-        arr = np.asarray(m, dtype=np.float32)
-        if arr.ndim > 2:
-            arr = arr.squeeze()
-        if arr.shape[0] == 0 or arr.shape[1] == 0:
+    def _resize(mp: Any) -> Any:
+        arr = np.asarray(mp, dtype=np.float32).squeeze()
+        if arr.ndim != 2 or arr.shape[0] == 0 or arr.shape[1] == 0:
             return np.zeros((img_h, img_w), dtype=np.float32)
-        return cv2.resize(arr, (img_w, img_h), interpolation=cv2.INTER_CUBIC)
+        return cv2.resize(arr, (img_w, img_h), interpolation=cv2.INTER_LINEAR)
 
-    def _norm01(m: "np.ndarray") -> "np.ndarray":
-        arr = np.asarray(m, dtype=np.float32)
-        mn, mx = float(np.min(arr)), float(np.max(arr))
-        return (arr - mn) / max(1e-8, mx - mn)
+    def _norm01(mp: Any) -> Any:
+        arr = np.asarray(mp, dtype=np.float32)
+        return (arr - float(arr.min())) / max(1e-8, float(arr.max()) - float(arr.min()))
 
-    # ------------------------------------------------------------------
-    # Layer 1: Swin-Tiny Backbone Stages 1~4
-    # ------------------------------------------------------------------
-    l1_stages_raw = buf.get("layer1_backbone_stages", [])
-    l1_per_stage: Dict[str, Any] = {}
-    stage_maps_resized: Dict[str, "np.ndarray"] = {}
-    for st in l1_stages_raw:
-        sname = st["stage_name"]
-        l2_m = st["l2_map"]
-        m_stats = compute_spatial_map_metrics(l2_m, gt_xywh, img_h, img_w)
-        m_stats["shape"] = st["shape"]
-        l1_per_stage[sname] = m_stats
-        stage_maps_resized[sname] = _norm01(_resize_to_img(l2_m))
+    # 注意：特征图覆盖的是"缩放+补边后的网络输入"，映射回原图时需按 img_shape（未补边部分）裁剪后再缩放
+    meta = buf.get("img_meta_x") or {}
+    img_shape = meta.get("img_shape") or []
 
-    l1_ratios = [v["target_to_bg_activation_ratio"] for v in l1_per_stage.values()] or [0.0]
-    l1_margins = [v["target_vs_strongest_distractor_margin"] for v in l1_per_stage.values()] or [0.0]
-    l1_entropies = [v["response_entropy"] for v in l1_per_stage.values()] or [1.0]
+    def _crop_valid(mp: Any, stride: int) -> Any:
+        arr = np.asarray(mp, dtype=np.float32).squeeze()
+        if len(img_shape) >= 2 and arr.ndim == 2:
+            vh = max(1, int(math.ceil(img_shape[0] / float(stride))))
+            vw = max(1, int(math.ceil(img_shape[1] / float(stride))))
+            arr = arr[:vh, :vw]
+        return arr
 
-    # ------------------------------------------------------------------
-    # Layer 2: 5-Level FPN (P2~P6)
-    # ------------------------------------------------------------------
-    l2_levels_raw = buf.get("layer2_fpn_levels", [])
-    l2_per_level: Dict[str, Any] = {}
-    fpn_strips: List["np.ndarray"] = []
-    for lv in l2_levels_raw:
-        lname = lv["level_name"]
-        l2_m = lv["l2_map"]
-        m_stats = compute_spatial_map_metrics(l2_m, gt_xywh, img_h, img_w)
-        m_stats["stride"] = lv["stride"]
-        m_stats["shape"] = lv["shape"]
-        l2_per_level[lname] = m_stats
-        strip = cv2.resize(_norm01(l2_m), (120, 120), interpolation=cv2.INTER_NEAREST)
-        fpn_strips.append(strip)
+    l1_per, l1_maps = {}, {}
+    for st in buf.get("layer1_backbone_stages", []):
+        stride = 2 ** (st["stage_index"] + 1)
+        mp = _crop_valid(st["l2_map"], stride)
+        l1_per[st["stage_name"]] = {**compute_spatial_map_metrics(mp, gt_for_maps, img_h, img_w), "shape": st["shape"], "stride": stride}
+        l1_maps[st["stage_name"]] = _norm01(_resize(mp))
 
-    fpn_montage = np.concatenate(fpn_strips, axis=1) if fpn_strips else np.zeros((120, 600), dtype=np.float32)
-    l2_ratios = [v["target_to_bg_activation_ratio"] for v in l2_per_level.values()] or [0.0]
-    l2_margins = [v["target_vs_strongest_distractor_margin"] for v in l2_per_level.values()] or [0.0]
-    l2_entropies = [v["response_entropy"] for v in l2_per_level.values()] or [1.0]
+    l2_per, strips = {}, []
+    for lv in buf.get("layer2_fpn_levels", []):
+        mp = _crop_valid(lv["l2_map"], lv["stride"])
+        l2_per[lv["level_name"]] = {**compute_spatial_map_metrics(mp, gt_for_maps, img_h, img_w), "shape": lv["shape"], "stride": lv["stride"]}
+        strips.append(cv2.resize(_norm01(mp), (120, 120), interpolation=cv2.INTER_NEAREST))
+    fpn_montage = np.concatenate(strips, axis=1) if strips else np.zeros((120, 600), dtype=np.float32)
 
-    # ------------------------------------------------------------------
-    # Layer 3: Dual-Semantic RPN Response (Cross-Correlation + Gram Matrix)
-    # ------------------------------------------------------------------
-    xcorr_levels = [x for x in buf.get("layer3_rpn_xcorr_levels", []) if x is not None]
-    xcorr_acc = np.zeros((img_h, img_w), dtype=np.float32)
-    l3_per_level_xcorr: Dict[str, Any] = {}
-    for xc in xcorr_levels:
-        lname = xc["level_name"]
-        l2_m = xc["l2_map"]
-        l3_per_level_xcorr[lname] = compute_spatial_map_metrics(l2_m, gt_xywh, img_h, img_w)
-        xcorr_acc += _norm01(_resize_to_img(l2_m))
-    if xcorr_levels:
-        xcorr_acc /= float(len(xcorr_levels))
+    l3a_per, acc, n_acc = {}, np.zeros((img_h, img_w), dtype=np.float32), 0
+    for k, xc in enumerate(buf.get("layer3a_rpn_modulation_levels", [])):
+        if xc is None:
+            continue
+        mp = _crop_valid(xc["l2_map"], 2 ** (k + 2))
+        l3a_per[xc["level_name"]] = {**compute_spatial_map_metrics(mp, gt_for_maps, img_h, img_w), "shape": xc["shape"], "abs_mean": xc["abs_mean"]}
+        acc += _norm01(_resize(mp))
+        n_acc += 1
+    if n_acc:
+        acc /= float(n_acc)
+    l3a = {
+        "source": "rpn_similarity_learning.proj_out[k] 输出 = x_corr[k]（similarity_encoders.py:30-32；_process_gallary:437-441 与 x[k] 相加）",
+        "per_level": l3a_per,
+        "combined": compute_spatial_map_metrics(acc, gt_for_maps, img_h, img_w) if n_acc else {},
+        "combined_map_note": "combined 为各层通道 L2 图归一化后取平均 —— " + PROV_DERIVED,
+        "num_levels_captured": n_acc,
+    }
 
-    # 计算二阶格拉姆矩阵响应图 (Gram Matrix Map across FPN levels)
-    gram_acc = np.zeros((img_h, img_w), dtype=np.float32)
-    l3_per_level_gram: Dict[str, Any] = {}
-    z_feat = getattr(model, "_bbox_feats_z", None)
-    if z_feat is not None and l2_levels_raw:
-        for lv in l2_levels_raw:
-            lname = lv["level_name"]
-            g_map = hook_mgr.compute_gram_matrix_response(z_feat, lv["tensor"])
-            l3_per_level_gram[lname] = compute_spatial_map_metrics(g_map, gt_xywh, img_h, img_w)
-            gram_acc += _norm01(_resize_to_img(g_map))
-        gram_acc /= float(len(l2_levels_raw))
+    # Layer 3B：Stage-2 相似度响应（逐 ROI 能量为派生量）
+    rcnn_main = [c for c in buf.get("layer3b_rcnn_similarity_calls", []) if c["phase"] == "rcnn_main"]
+    bg_sim = [c for c in buf.get("layer3b_rcnn_similarity_calls", []) if c["phase"] == "bg_matching"]
+    sf4 = normalize_scale_factor(meta.get("scale_factor_raw"))
+    props_orig = boxes_net_to_orig(buf.get("rpn_proposals_net") or [], sf4) or []
+    energy_vs_iou: List[Tuple[float, float]] = []
+    if rcnn_main and props_orig and exist_f == 1 and len(rcnn_main[0]["per_roi_l2_energy"]) == len(props_orig):
+        gx = xywh_to_xyxy(gt_xywh)
+        energy_vs_iou = [(e, compute_iou_xyxy(p, gx)) for e, p in zip(rcnn_main[0]["per_roi_l2_energy"], props_orig)]
+    l3b: Dict[str, Any] = {
+        "source": "rcnn_similarity_learning.proj_out 输出 = proj_out(proj_x(x) * proj_z(z))（similarity_encoders.py:53）",
+        "rcnn_main_out_shape": rcnn_main[0]["out_shape"] if rcnn_main else None,
+        "bg_matching_out_shapes": [c["out_shape"] for c in bg_sim],
+        "per_roi_l2_energy_note": PROV_DERIVED,
+        "energy_of_best_iou_proposal": None, "max_energy": None, "rank_of_best_iou_proposal_by_energy": None,
+    }
+    if energy_vs_iou:
+        best_j = max(range(len(energy_vs_iou)), key=lambda j: energy_vs_iou[j][1])
+        energies = [e for e, _ in energy_vs_iou]
+        l3b["energy_of_best_iou_proposal"] = round(energies[best_j], 6)
+        l3b["max_energy"] = round(max(energies), 6)
+        l3b["rank_of_best_iou_proposal_by_energy"] = 1 + sum(1 for e in energies if e > energies[best_j])
 
-    xcorr_combined_metrics = compute_spatial_map_metrics(xcorr_acc, gt_xywh, img_h, img_w)
-    gram_combined_metrics = compute_spatial_map_metrics(gram_acc, gt_xywh, img_h, img_w)
+    l456 = build_layer5_and_6_records(buf, gt_xywh, exist_f)
 
-    # ------------------------------------------------------------------
-    # Layer 4: RPN Top-64 Proposals Spatial Density & Recall IoU
-    # ------------------------------------------------------------------
-    roi_calls = buf.get("layer4_roi_extractor_calls", [])
-    if isinstance(scale_factor, (list, tuple, np.ndarray)):
-        sf = np.asarray(scale_factor, dtype=np.float32).reshape(-1)
-        if sf.size < 4:
-            sf = np.ones(4, dtype=np.float32)
-    else:
-        sf = np.full(4, float(scale_factor or 1.0), dtype=np.float32)
-
-    gt_xyxy = xywh_to_xyxy(gt_xywh)
-    rpn_density = np.zeros((img_h, img_w), dtype=np.float32)
-    top64_boxes_xyxy: List[List[float]] = []
-    rpn_top64_max_iou = 0.0
-    rpn_top1000_max_iou = 0.0
-    rpn_hit_count_05 = 0
-
-    if roi_calls:
-        # 第 1 次 bbox_roi_extractor 调用即为 RPN 生成的全部候选框 (按 RPN 得分降序)
-        all_rpn_scaled = roi_calls[0]["rois_xyxy_scaled"]
-        all_rpn_orig = all_rpn_scaled / sf[None, :4]
-        ious_all = [compute_iou_xyxy(b.tolist(), gt_xyxy) for b in all_rpn_orig]
-        if ious_all:
-            rpn_top1000_max_iou = float(max(ious_all))
-            rpn_top64_max_iou = float(max(ious_all[:64]))
-            rpn_hit_count_05 = int(sum(1 for v in ious_all[:64] if v >= 0.5))
-
-        for b in all_rpn_orig[:64]:
-            bx1 = max(0, min(img_w - 1, int(round(b[0]))))
-            by1 = max(0, min(img_h - 1, int(round(b[1]))))
-            bx2 = max(bx1 + 1, min(img_w, int(round(b[2]))))
-            by2 = max(by1 + 1, min(img_h, int(round(b[3]))))
-            rpn_density[by1:by2, bx1:bx2] += 1.0
-            top64_boxes_xyxy.append([round(float(v), 2) for v in b[:4]])
-
-    rpn_density_metrics = compute_spatial_map_metrics(rpn_density, gt_xywh, img_h, img_w)
-
-    # ------------------------------------------------------------------
-    # Layer 5 & Layer 6: Versatile R-CNN Top-5 Competition & 11-way BG Suppression
-    # ------------------------------------------------------------------
-    # 从 roi_extractor_calls[1:6] 拿到决赛圈 Top-5 候选框坐标，
-    # 从 bbox_head_calls[2:7] 拿到每个 Top-5 候选框在 11 路背景模板上的匹配抑制分！
-    bbox_head_calls = buf.get("layer5_bbox_head_calls", [])
-    top5_candidates: List[Dict[str, Any]] = []
-
-    # 解析 Top-5 候选框（siamdt_rcnn.py lines 463-498）
-    num_mm_calls = min(5, max(0, len(roi_calls) - 1))
-    for mm in range(num_mm_calls):
-        mm_roi_scaled = roi_calls[1 + mm]["rois_xyxy_scaled"][0]
-        # 注意：在 _process_gallary 中 simple_test_bboxes 传入了 rescale=True，
-        # 因此 newens_bboxes 已经是原图尺度坐标！
-        mm_box_xyxy = [float(v) for v in mm_roi_scaled[:4]]
-        mm_iou = compute_iou_xyxy(mm_box_xyxy, gt_xyxy)
-
-        bg_scores_11: List[float] = []
-        bg_max_penalty = 0.0
-        if (2 + mm) < len(bbox_head_calls):
-            bg_probs = bbox_head_calls[2 + mm]["fg_probs"]
-            bg_scores_11 = [round(float(s), 4) for s in bg_probs[:11]]
-            if bg_scores_11:
-                bg_max_penalty = float(max(bg_scores_11))
-
-        top5_candidates.append({
-            "rank": mm + 1,
-            "branch": "Track/Det-Ensemble",
-            "bbox_xyxy": [round(v, 2) for v in mm_box_xyxy],
-            "iou": round(mm_iou, 4),
-            "bg_scores_11way": bg_scores_11,
-            "bg_supp_penalty_max": round(bg_max_penalty, 4),
-            "pre_bg_supp_score": round(min(0.999, float(conf_val) + bg_max_penalty * (0.85 if mm == 0 else 0.7)), 4),
-            "final_score": round(float(conf_val) if mm == 0 else max(0.0, float(conf_val) - 0.08 * mm), 4),
-        })
-
-    # 若可以通过 bbox_head_calls[0] (Tracking) 和 bbox_head_calls[1] (Detection) 区分分支来源
-    if len(bbox_head_calls) >= 2 and top5_candidates:
-        tra_max = float(np.max(bbox_head_calls[0]["fg_probs"])) if len(bbox_head_calls[0]["fg_probs"]) else 0.0
-        det_max = float(np.max(bbox_head_calls[1]["fg_probs"])) if len(bbox_head_calls[1]["fg_probs"]) else 0.0
-        for idx_c, c in enumerate(top5_candidates):
-            c["branch"] = "Track-Sim" if (idx_c % 2 == 0 and tra_max >= det_max * 0.9) else "Det-Branch"
-            c["pre_bg_supp_score"] = round(min(0.999, max(tra_max, det_max) * (1.0 - 0.04 * idx_c)), 4)
-            c["final_score"] = round(c["pre_bg_supp_score"] - c["bg_supp_penalty_max"], 4)
-
-    # 按 final_score 排序并计算最佳真实 IoU 候选框的排位 (rcnn_rank_of_best_iou_proposal)
-    if top5_candidates:
-        best_iou_idx = int(np.argmax([c["iou"] for c in top5_candidates]))
-        best_rank = best_iou_idx + 1
-        best_top5_iou = float(top5_candidates[best_iou_idx]["iou"])
-        top1_iou = float(top5_candidates[0]["iou"])
-    else:
-        best_rank = 1
-        best_top5_iou = float(iou_val)
-        top1_iou = float(iou_val)
-
-    rank_inversion = bool(best_rank > 1 and best_top5_iou >= 0.40 and (best_top5_iou - top1_iou) >= 0.15)
-
-    # ------------------------------------------------------------------
-    # Layer 6: Dynamic Template z_dyn_feat (1x256x7x7) & 11-way BG Bank (11x256x7x7)
-    # ------------------------------------------------------------------
+    # Layer 6 模板派生统计
     z_curr = getattr(model, "_bbox_feats_z", None)
     z_init = hook_mgr.initial_template_feat
     bg_bank = getattr(model, "_bbox_feats_bg", None)
-
-    cos_sim_init = 1.0
-    l2_drift_ratio = 0.0
+    cos_sim, drift = None, None
     z_init_map = np.zeros((7, 7), dtype=np.float32)
     z_curr_map = np.zeros((7, 7), dtype=np.float32)
     bg_mean_map = np.zeros((7, 7), dtype=np.float32)
-
-    if z_curr is not None and torch.is_tensor(z_curr):
+    if torch.is_tensor(z_curr):
         zc = z_curr.detach().float()
         z_curr_map = _norm01(torch.norm(zc[0], p=2, dim=0).cpu().numpy())
-        if z_init is not None and torch.is_tensor(z_init):
-            zi = z_init.detach().float().to(zc.device)
+        if torch.is_tensor(z_init):
+            zi = z_init.to(zc.device)
             z_init_map = _norm01(torch.norm(zi[0], p=2, dim=0).cpu().numpy())
-            cos_sim_init = float(
-                F.cosine_similarity(zc.reshape(1, -1), zi.reshape(1, -1), dim=1).item()
-            )
-            l2_drift_ratio = float(
-                torch.norm(zc - zi, p=2).item() / max(1e-6, torch.norm(zi, p=2).item())
-            )
-        else:
-            z_init_map = z_curr_map.copy()
+            cos_sim = float(F.cosine_similarity(zc.reshape(1, -1), zi.reshape(1, -1), dim=1).item())
+            drift = float(torch.norm(zc - zi).item() / max(1e-6, torch.norm(zi).item()))
+    if torch.is_tensor(bg_bank):
+        bg_mean_map = _norm01(torch.norm(bg_bank.detach().float(), p=2, dim=1).mean(dim=0).cpu().numpy())
+    lr = l456["layer6_template_update_audit"].get("learning_rate")
+    n_upd = hook_mgr.cumulative_update_count
+    l456["layer6_template_update_audit"].update({
+        "cumulative_update_count": n_upd,
+        "init_template_residual_weight": round((1.0 - lr) ** n_upd, 6) if lr is not None else None,
+        "template_cosine_sim_to_init": round(cos_sim, 6) if cos_sim is not None else None,
+        "template_l2_drift_ratio": round(drift, 6) if drift is not None else None,
+        "bg_bank_size_current": int(bg_bank.shape[0]) if torch.is_tensor(bg_bank) else None,
+        "derived_note": "cosine/drift/residual_weight 为 " + PROV_DERIVED,
+    })
+    sep = np.zeros((7, 1), dtype=np.float32)
+    template_comp_map = np.concatenate([z_init_map, sep, z_curr_map, sep, bg_mean_map], axis=1)
 
-    if bg_bank is not None and torch.is_tensor(bg_bank):
-        bg_t = bg_bank.detach().float()  # (11, 256, 7, 7)
-        bg_mean_map = _norm01(torch.norm(bg_t, p=2, dim=1).mean(dim=0).cpu().numpy())
-
-    sep_col = np.zeros((7, 1), dtype=np.float32)
-    template_comp_map = np.concatenate([z_init_map, sep_col, z_curr_map, sep_col, bg_mean_map], axis=1)
-
-    template_pollution = bool(up_flag and iou_val < 0.30)
-    mean_bg_penalty = (
-        float(np.mean([c["bg_supp_penalty_max"] for c in top5_candidates]))
-        if top5_candidates
-        else 0.0
-    )
-
-    metrics_dict: Dict[str, Any] = {
-        "layer1_backbone": {
-            "target_to_bg_activation_ratio": round(float(np.mean(l1_ratios)), 6),
-            "target_vs_strongest_distractor_margin": round(float(np.mean(l1_margins)), 6),
-            "response_entropy": round(float(np.mean(l1_entropies)), 6),
-            "mean_target_to_bg_ratio": round(float(np.mean(l1_ratios)), 6),
-            "mean_distractor_margin": round(float(np.mean(l1_margins)), 6),
-            "per_stage": l1_per_stage,
-        },
-        "layer2_fpn": {
-            "target_to_bg_activation_ratio": round(float(np.mean(l2_ratios)), 6),
-            "target_vs_strongest_distractor_margin": round(float(np.mean(l2_margins)), 6),
-            "response_entropy": round(float(np.mean(l2_entropies)), 6),
-            "per_level": l2_per_level,
-        },
-        "layer3_ds_rpn": {
-            "target_to_bg_activation_ratio": xcorr_combined_metrics["target_to_bg_activation_ratio"],
-            "target_vs_strongest_distractor_margin": xcorr_combined_metrics["target_vs_strongest_distractor_margin"],
-            "response_entropy": xcorr_combined_metrics["response_entropy"],
-            "xcorr_combined": xcorr_combined_metrics,
-            "gram_matrix_combined": gram_combined_metrics,
-            "per_level_xcorr": l3_per_level_xcorr,
-            "per_level_gram": l3_per_level_gram,
-        },
-        "layer4_rpn_proposals": {
-            "target_to_bg_activation_ratio": rpn_density_metrics["target_to_bg_activation_ratio"],
-            "target_vs_strongest_distractor_margin": rpn_density_metrics["target_vs_strongest_distractor_margin"],
-            "response_entropy": rpn_density_metrics["response_entropy"],
-            "rpn_recall_iou": round(rpn_top64_max_iou, 6),
-            "rpn_top64_max_iou": round(rpn_top64_max_iou, 6),
-            "rpn_top1000_max_iou": round(rpn_top1000_max_iou, 6),
-            "rpn_hit_count_iou_05": rpn_hit_count_05,
-            "top64_boxes_xyxy": top64_boxes_xyxy,
-        },
-        "layer5_rcnn_top5": {
-            "rcnn_rank_of_best_iou_proposal": best_rank,
-            "rank_inversion_detected": rank_inversion,
-            "top1_iou": round(top1_iou, 6),
-            "best_top5_iou": round(best_top5_iou, 6),
-            "top1_vs_best_iou_gap": round(best_top5_iou - top1_iou, 6),
-            "top5_candidates": top5_candidates,
-        },
-        "layer6_dyn_template_bg_supp": {
-            "template_updated": bool(up_flag),
-            "template_pollution_triggered": template_pollution,
-            "template_cosine_sim_to_init": round(cos_sim_init, 6),
-            "template_l2_drift_ratio": round(l2_drift_ratio, 6),
-            "bg_bank_size": int(bg_bank.shape[0]) if (bg_bank is not None and torch.is_tensor(bg_bank)) else 11,
-            "mean_bg_suppression_penalty": round(mean_bg_penalty, 6),
-        },
+    layers = {
+        "layer1_backbone": {"per_stage": l1_per},
+        "layer2_fpn": {"per_level": l2_per},
+        "layer3a_rpn_modulation": l3a,
+        "layer3b_rcnn_similarity": l3b,
+        **l456,
     }
-    metrics_dict["root_cause_verdict"] = diagnose_primary_bottleneck(metrics_dict)
-
-    visual_maps = {
-        "layer1_stage1_c2": stage_maps_resized.get("Stage1_C2", np.zeros((img_h, img_w), dtype=np.float32)),
-        "layer1_stage4_c5": stage_maps_resized.get("Stage4_C5", np.zeros((img_h, img_w), dtype=np.float32)),
-        "layer2_fpn_montage": fpn_montage,
-        "layer3_xcorr_map": xcorr_acc,
-        "layer3_gram_map": gram_acc,
-        "layer4_rpn_density_map": _norm01(rpn_density),
-        "layer6_template_comparison_map": template_comp_map,
-    }
+    layers["root_cause_verdict"] = diagnose_primary_bottleneck(layers)
 
     return {
-        "seq_id": seq_id,
-        "frame_id": frame_id,
-        "phase_tag": phase_tag,
+        "seq_id": seq_id, "frame_id": frame_id, "phase_tag": phase_tag, "exist": exist_f,
         "gt_bbox": [round(float(x), 3) for x in gt_xywh],
         "pred_bbox": [round(float(x), 3) for x in pred_xywh],
-        "iou": round(float(iou_val), 6),
+        "iou": round(float(iou_val), 6) if iou_val is not None else None,
         "confidence": round(float(conf_val), 6),
         "template_updated": bool(up_flag),
-        "metrics": metrics_dict,
-        "visual_maps": visual_maps,
+        "metrics": layers,
+        "visual_maps": {
+            "layer1_stage1": l1_maps.get("Stage1_C2", np.zeros((img_h, img_w), dtype=np.float32)),
+            "layer1_stage4": l1_maps.get("Stage4_C5", np.zeros((img_h, img_w), dtype=np.float32)),
+            "layer2_fpn_montage": fpn_montage,
+            "layer3a_rpn_modulation_map": acc,
+            "layer3b_energy_vs_iou": energy_vs_iou,
+            "layer6_template_comparison_map": template_comp_map,
+            "proposals_orig": props_orig[:64],
+        },
     }
 
 
 # ==============================================================================
-# 6. 真实序列推理与六层解剖主流程 (支持 Colab GPU 实跑与 Mock 合成验证)
+# 5. 全景图（标题中明确标注派生量）
+# ==============================================================================
+
+def render_6layer_anatomy_figure(frame_rgb: Any, fd: Dict[str, Any], output_png_path: Path) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.patches as patches
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "Noto Sans CJK SC", "WenQuanYi Micro Hei", "DejaVu Sans"]
+    plt.rcParams["axes.unicode_minus"] = False
+    m = fd["metrics"]
+    maps = fd["visual_maps"]
+    verdict = m["root_cause_verdict"]
+    img_h, img_w = frame_rgb.shape[:2]
+    fig, axes = plt.subplots(3, 4, figsize=(24, 16.5), dpi=140)
+    fig.patch.set_facecolor("#0f172a")
+    iou_txt = f"{fd['iou']:.3f}" if fd["iou"] is not None else "n/a"
+    fig.suptitle(
+        f"SiamDT 6-Layer Anatomy v{PROBE_VERSION} | {fd['seq_id']} #{fd['frame_id']:04d} ({fd['phase_tag']}) | IoU={iou_txt} | "
+        f"Updated={fd['template_updated']} | [{verdict['verdict_code']}] (analyst heuristic)\n"
+        "Legend: [captured]=model path value; [derived]=post-hoc, NOT model path",
+        fontsize=12.5, fontweight="bold", color="#f8fafc", y=0.985)
+
+    def _style(ax: Any, title: str) -> None:
+        ax.set_facecolor("#1e293b")
+        ax.set_title(title, fontsize=9.8, fontweight="bold", color="#e2e8f0", pad=6)
+        ax.tick_params(colors="#cbd5e1", labelsize=7.5)
+
+    def _boxes(ax: Any) -> None:
+        gx, gy, gw, gh = fd["gt_bbox"]
+        px, py, pw, ph = fd["pred_bbox"]
+        if gw > 0 and gh > 0:
+            ax.add_patch(patches.Rectangle((gx, gy), gw, gh, lw=2.0, ec="#22c55e", fc="none"))
+        if pw > 0 and ph > 0:
+            ax.add_patch(patches.Rectangle((px, py), pw, ph, lw=2.0, ls="--", ec="#ef4444", fc="none"))
+
+    def _fmt(v: Any, spec: str = ".2f") -> str:
+        return format(v, spec) if isinstance(v, (int, float)) else "n/a"
+
+    ax = axes[0, 0]
+    ax.imshow(frame_rgb)
+    _boxes(ax)
+    _style(ax, f"[Input] Frame #{fd['frame_id']:04d}  Green=GT  Red=Pred(selected)")
+
+    for ax, key, sname, ttl in ((axes[0, 1], "layer1_stage1", "Stage1_C2", "L1 Swin Stage-1 (C2,s=4)"),
+                                (axes[0, 2], "layer1_stage4", "Stage4_C5", "L1 Swin Stage-4 (C5,s=32)")):
+        im = ax.imshow(maps[key], cmap="magma", extent=[0, img_w, img_h, 0])
+        _boxes(ax)
+        st = m["layer1_backbone"]["per_stage"].get(sname, {})
+        _style(ax, f"[{ttl}] channel-L2 [derived]\nT/BG={_fmt(st.get('target_to_bg_activation_ratio'))} Margin={_fmt(st.get('target_vs_strongest_distractor_margin'), '+.2f')}")
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    ax = axes[0, 3]
+    im = ax.imshow(maps["layer2_fpn_montage"], cmap="viridis", aspect="auto")
+    ratios = " | ".join(f"P{k}:{_fmt(m['layer2_fpn']['per_level'].get(f'P{k}', {}).get('target_to_bg_activation_ratio'))}" for k in range(2, 7))
+    _style(ax, f"[L2 FPN P2..P6] channel-L2 [derived]\nT/BG {ratios}")
+    ax.set_yticks([])
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    ax = axes[1, 0]
+    im = ax.imshow(maps["layer3a_rpn_modulation_map"], cmap="jet", extent=[0, img_w, img_h, 0])
+    _boxes(ax)
+    c3 = m["layer3a_rpn_modulation"].get("combined", {})
+    _style(ax, f"[L3A] RPN_Similarity proj_out[k] response [captured tensor; L2 map derived]\n"
+               f"levels={m['layer3a_rpn_modulation']['num_levels_captured']} T/BG={_fmt(c3.get('target_to_bg_activation_ratio'))} Margin={_fmt(c3.get('target_vs_strongest_distractor_margin'), '+.3f')}")
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    ax = axes[1, 1]
+    ev = maps["layer3b_energy_vs_iou"]
+    if ev:
+        ax.scatter([e for e, _ in ev], [i for _, i in ev], s=6, c="#38bdf8", alpha=0.6)
+        ax.set_xlabel("per-ROI L2 energy of Stage-2 sim response [derived]", color="#cbd5e1", fontsize=8)
+        ax.set_ylabel("proposal GT IoU [derived]", color="#cbd5e1", fontsize=8)
+    l3b = m["layer3b_rcnn_similarity"]
+    _style(ax, f"[L3B] RCNN_Similarity proj_out (template vs proposals)\n"
+               f"out={l3b.get('rcnn_main_out_shape')} best-IoU ROI energy rank={l3b.get('rank_of_best_iou_proposal_by_energy')}")
+
+    ax = axes[1, 2]
+    ax.imshow(frame_rgb, alpha=0.6)
+    for p in maps["proposals_orig"][:25]:
+        ax.add_patch(patches.Rectangle((p[0], p[1]), max(1.0, p[2] - p[0]), max(1.0, p[3] - p[1]), lw=0.8, ec="#38bdf8", fc="none", alpha=0.7))
+    _boxes(ax)
+    l4 = m["layer4_rpn_proposals"]
+    _style(ax, f"[L4] RPN proposals (orig coords, /scale_factor) [captured]\n"
+               f"N={l4['num_proposals']} maxIoU@64={_fmt(l4['rpn_top64_max_iou'], '.3f')} maxIoU@all={_fmt(l4['rpn_all_max_iou'], '.3f')} [derived]")
+
+    ax = axes[1, 3]
+    ax.imshow(frame_rgb)
+    _boxes(ax)
+    l5 = m["layer5_rcnn_top5"]
+    palette = ["#ef4444", "#f97316", "#eab308", "#06b6d4", "#a855f7"]
+    for i, c in enumerate(l5["candidates"]):
+        x1, y1, x2, y2 = c["bbox_xyxy"]
+        col = palette[i % 5]
+        ax.add_patch(patches.Rectangle((x1, y1), max(2.0, x2 - x1), max(2.0, y2 - y1), lw=2.2 if c["selected_by_tracker"] else 1.3, ec=col, fc="none"))
+        br = "tra" if str(c["branch"]).startswith("similarity") else ("det" if str(c["branch"]).startswith("detection") else "?")
+        ax.text(x1, max(10.0, y1 - 3.0), f"#{c['rank_pre_suppression']}({br}) S={_fmt(c['final_score'])} IoU={_fmt(c['gt_iou'])}",
+                fontsize=7, color="white", bbox=dict(boxstyle="round,pad=0.15", fc=col, alpha=0.8, ec="none"))
+    _style(ax, "[L5A] Source Top-5 (tra+det merged, :452-460) [captured]\nthick=selected by tracker; IoU [derived]")
+
+    ax = axes[2, 0]
+    cands = l5["candidates"]
+    if cands:
+        x = np.arange(len(cands))
+        w = 0.2
+        vals = lambda k: [c[k] if isinstance(c[k], (int, float)) else 0.0 for c in cands]  # noqa: E731
+        ax.bar(x - 1.5 * w, vals("pre_bg_supp_score"), w, label="pre-supp [captured]", color="#60a5fa")
+        ax.bar(x - 0.5 * w, vals("bg_penalty"), w, label="bg penalty [captured]", color="#f43f5e")
+        ax.bar(x + 0.5 * w, vals("final_score"), w, label="final [captured]", color="#a855f7")
+        ax.bar(x + 1.5 * w, [c["gt_iou"] or 0.0 for c in cands], w, label="GT IoU [derived]", color="#10b981")
+        ax.set_xticks(x, [f"#{c['rank_pre_suppression']}" for c in cands], color="white")
+        ax.legend(fontsize=7, facecolor="#0f172a", labelcolor="white")
+    _style(ax, "[L5B] Real score decomposition (null shown as 0)\npost_bg/iou_reward = source arithmetic [recomputed]")
+
+    ax = axes[2, 1]
+    im = ax.imshow(maps["layer6_template_comparison_map"], cmap="inferno", aspect="auto")
+    l6 = m["layer6_template_update_audit"]
+    _style(ax, f"[L6A] z_init | z_current | BG-bank mean (channel-L2) [derived]\n"
+               f"cos(z_t,z_0)={_fmt(l6.get('template_cosine_sim_to_init'), '.3f')} residual(1-lr)^n={_fmt(l6.get('init_template_residual_weight'), '.3f')}")
+    ax.set_yticks([])
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    ax = axes[2, 2]
+    ax.axis("off")
+    cond = l6.get("source_update_condition") or {}
+    txt = [
+        "[L6B] Template update audit (source :500, :402)",
+        f"up_flag [captured]          : {l6.get('template_updated')}",
+        f"lr (model._learning_rate)   : {l6.get('learning_rate')}",
+        f"tra0+det0 score [recomputed]: {_fmt(cond.get('score_sum'), '.4f')}  (> {SOURCE_UPDATE_SCORE_SUM_THR})",
+        f"IoU(det0,tra0) [recomputed] : {_fmt(cond.get('tra_det_top1_iou'), '.4f')}  (> {SOURCE_UPDATE_IOU_THR})",
+        f"consistent with up_flag     : {l6.get('source_condition_consistent_with_up_flag')}",
+        f"update box GT IoU [derived] : {l6.get('update_box_gt_iou')}",
+        f"suspicious [analyst<{ANALYST_UPDATE_GT_IOU_THR}]    : {l6.get('posthoc_suspicious_update')}",
+        f"cumulative updates          : {l6.get('cumulative_update_count')}",
+    ]
+    ax.text(0.02, 0.95, "\n".join(txt), transform=ax.transAxes, va="top", family="monospace", fontsize=8.5, color="#f1f5f9")
+    _style(ax, "[L6B] Template update audit")
+
+    ax = axes[2, 3]
+    ax.axis("off")
+    ax.text(0.02, 0.95, f"Verdict (analyst heuristic, NOT model output):\n{verdict['verdict_code']}\n\n{verdict['summary_zh']}",
+            transform=ax.transAxes, va="top", fontsize=9, color="#fde047", wrap=True)
+    _style(ax, "[Scorecard]")
+
+    plt.tight_layout(rect=[0, 0.01, 1, 0.95])
+    output_png_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(str(output_png_path), facecolor=fig.get_facecolor(), bbox_inches="tight")
+    plt.close(fig)
+
+
+# ==============================================================================
+# 6. 真实序列推理主流程
 # ==============================================================================
 
 def find_failure_onset_from_telemetry(telemetry_jsonl: Path) -> int:
-    """从已有逐帧遥测 `.jsonl` 中自动寻找首次显著失败起点帧 `t_0` (IoU < 0.1)。"""
-    if not telemetry_jsonl.exists():
-        return 25
-    rows = [
-        json.loads(line)
-        for line in telemetry_jsonl.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    rows = [json.loads(line) for line in telemetry_jsonl.read_text(encoding="utf-8").splitlines() if line.strip()]
     for r in rows[1:]:
         if int(r.get("exist", 1)) == 1 and float(r.get("iou", 1.0)) < 0.10:
             return int(r["frame_id"])
-    # 若无 <0.1 的帧，则取 IoU 最低帧
-    valid_rows = [r for r in rows[1:] if int(r.get("exist", 1)) == 1]
-    if valid_rows:
-        worst = min(valid_rows, key=lambda x: float(x.get("iou", 1.0)))
-        return int(worst["frame_id"])
+    valid = [r for r in rows[1:] if int(r.get("exist", 1)) == 1]
+    if valid:
+        return int(min(valid, key=lambda x: float(x.get("iou", 1.0)))["frame_id"])
     return max(1, len(rows) // 2)
 
 
-def run_live_siamdt_probe_on_sequence(
-    siamdt_dir: Path,
-    seq_dir: Path,
-    output_dir: Path,
-    config_rel: str = "configs/siamdt_swin_tiny_sgd.py",
-    ckpt_rel: str = "checkpoints/siamdt_swin_tiny_sgd.pth",
-    onset_frame: int = 0,
-    explicit_frames: Optional[List[int]] = None,
-    telemetry_jsonl: Optional[Path] = None,
-) -> Dict[str, Any]:
-    """在真实 SiamDTRCNN 模型与红外序列上运行 6 层 forward_hook 特征解剖。"""
-    import numpy as np
-    import torch
+def _load_sequence(seq_dir: Path) -> Tuple[List[Path], List[List[float]], List[int]]:
+    lbl_file = seq_dir / "IR_label.json"
+    if not lbl_file.exists():
+        raise FileNotFoundError(f"未找到序列标注文件: {lbl_file}")
+    lbl = json.loads(lbl_file.read_text(encoding="utf-8"))
+    gt_rects = lbl["gt_rect"]
+    exist_flags = lbl.get("exist", [1] * len(gt_rects))
+    frame_files = sorted(seq_dir.glob("*.jpg"))
+    return frame_files, gt_rects, exist_flags
 
-    orig_cwd = Path.cwd()
+
+def _build_tracker(siamdt_dir: Path, config_rel: str, ckpt_rel: str) -> Tuple[Any, Any]:
     os.chdir(siamdt_dir)
     if str(siamdt_dir) not in sys.path:
         sys.path.insert(0, str(siamdt_dir))
+    import init_paths  # noqa: F401
+    import libs.data as data
+    import libs.ops as ops
+    from trackers import SiamDTTracker
+    transforms = data.BasicPairTransforms(train=False)
+    tracker = SiamDTTracker(config_rel, ckpt_rel, transforms, name_suffix="6layer_probe", visualize=False)
+    return tracker, ops
 
+
+def _gt_of(gt_rects: List[Any], exist_flags: List[int], f_idx: int) -> Tuple[List[float], int]:
+    g = gt_rects[f_idx] if f_idx < len(gt_rects) else []
+    gt = [float(x) for x in g] if isinstance(g, (list, tuple)) and len(g) == 4 else [0.0, 0.0, 0.0, 0.0]
+    ex = int(exist_flags[f_idx]) if f_idx < len(exist_flags) else 1
+    return gt, ex
+
+
+def _init_tracker_on_seq(tracker: Any, ops: Any, frame_files: List[Path], gt_rects: List[Any]) -> None:
+    import numpy as np
+    gt0 = [float(x) for x in gt_rects[0]]
+    init_xyxy = np.array([gt0[0], gt0[1], gt0[0] + gt0[2] - 1.0, gt0[1] + gt0[3] - 1.0], dtype=np.float32)
+    tracker.init(ops.read_image(str(frame_files[0]), tracker.color_fmt), init_xyxy)
+
+
+def run_live_siamdt_probe_on_sequence(
+    siamdt_dir: Path, seq_dir: Path, output_dir: Path, config_rel: str, ckpt_rel: str,
+    onset_frame: int = 0, explicit_frames: Optional[List[int]] = None, telemetry_jsonl: Optional[Path] = None,
+    holdout_info: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    orig_cwd = Path.cwd()
+    seq_dir = seq_dir.resolve()
+    output_dir = output_dir.resolve()
     try:
-        import init_paths  # noqa: F401
-        import libs.data as data
-        import libs.ops as ops
-        from trackers import SiamDTTracker
-
-        lbl_file = seq_dir / "IR_label.json"
-        if not lbl_file.exists():
-            raise FileNotFoundError(f"未找到序列标注文件: {lbl_file}")
-
-        lbl = json.loads(lbl_file.read_text(encoding="utf-8"))
-        gt_rects = lbl["gt_rect"]
-        exist_flags = lbl.get("exist", [1] * len(gt_rects))
-        frame_files = sorted(seq_dir.glob("*.jpg"))
+        frame_files, gt_rects, exist_flags = _load_sequence(seq_dir)
         total_f = min(len(frame_files), len(gt_rects))
         if total_f < 2:
             raise RuntimeError(f"序列 {seq_dir.name} 帧数不足 ({total_f})")
-
-        # 确定失败起点帧与待解剖关键帧列表
         if onset_frame <= 0:
-            if telemetry_jsonl and telemetry_jsonl.exists():
-                onset_frame = find_failure_onset_from_telemetry(telemetry_jsonl)
-            else:
-                onset_frame = min(total_f - 1, max(10, total_f // 3))
-
-        target_keyframes = select_diagnostic_keyframes(
-            total_frames=total_f,
-            onset_frame=onset_frame,
-            explicit_frames=explicit_frames,
-        )
-        keyframe_dict = {f_idx: tag for f_idx, tag in target_keyframes}
-        max_needed_frame = max(keyframe_dict.keys())
-
-        transforms = data.BasicPairTransforms(train=False)
-        tracker = SiamDTTracker(config_rel, ckpt_rel, transforms, name_suffix="6layer_probe", visualize=False)
+            onset_frame = find_failure_onset_from_telemetry(telemetry_jsonl) if (telemetry_jsonl and telemetry_jsonl.exists()) \
+                else min(total_f - 1, max(10, total_f // 3))
+        keyframes = dict(select_diagnostic_keyframes(total_f, onset_frame, explicit_frames))
+        tracker, ops = _build_tracker(siamdt_dir, config_rel, ckpt_rel)
         hook_mgr = SiamDT6LayerHookManager(tracker.model)
-
-        # Frame 0 初始化模板
-        gt0 = [float(x) for x in gt_rects[0]]
-        init_xyxy = np.array([gt0[0], gt0[1], gt0[0] + gt0[2] - 1.0, gt0[1] + gt0[3] - 1.0], dtype=np.float32)
-        img0 = ops.read_image(str(frame_files[0]), tracker.color_fmt)
-        tracker.init(img0, init_xyxy)
+        _init_tracker_on_seq(tracker, ops, frame_files, gt_rects)
         hook_mgr.snapshot_initial_template()
-
         output_dir.mkdir(parents=True, exist_ok=True)
-        probed_frames_metrics: List[Dict[str, Any]] = []
-        generated_pngs: List[str] = []
-
-        for f_idx in range(1, max_needed_frame + 1):
+        records: List[Dict[str, Any]] = []
+        pngs: List[str] = []
+        for f_idx in range(1, max(keyframes) + 1):
             hook_mgr.clear_frame_buffer()
             img = ops.read_image(str(frame_files[f_idx]), tracker.color_fmt)
-
-            # 获取当前帧缩放因子以还原 RPN 候选框坐标
-            img_meta_tmp = {"ori_shape": img.shape}
-            _, img_meta_proc, _ = tracker.transforms._process_gallary(img, img_meta_tmp, None)
-            scale_factor = img_meta_proc.get("scale_factor", 1.0)
-
             results, up_flag = tracker.update(img, return_all=True)
-            max_ind = int(results[:, -1].argmax())
-            box_xyxy = results[max_ind, :4]
+            max_ind = int(results[:, 4].argmax())
+            bx = results[max_ind, :4]
             conf = float(results[max_ind, 4])
-            pred_xywh = [
-                float(box_xyxy[0]),
-                float(box_xyxy[1]),
-                float(box_xyxy[2] - box_xyxy[0] + 1.0),
-                float(box_xyxy[3] - box_xyxy[1] + 1.0),
-            ]
-            gt_f = [float(x) for x in gt_rects[f_idx]] if len(gt_rects[f_idx]) == 4 else [0.0, 0.0, 0.0, 0.0]
-            exist_f = int(exist_flags[f_idx])
-            iou_f = compute_iou_xyxy(xywh_to_xyxy(pred_xywh), xywh_to_xyxy(gt_f)) if exist_f == 1 else 0.0
-
-            if f_idx in keyframe_dict:
-                phase_tag = keyframe_dict[f_idx]
-                frame_anatomy = build_frame_anatomy_from_hook_buffer(
-                    seq_id=seq_dir.name,
-                    frame_id=f_idx,
-                    phase_tag=phase_tag,
-                    img_rgb=img,
-                    gt_xywh=gt_f,
-                    pred_xywh=pred_xywh,
-                    iou_val=iou_f,
-                    conf_val=conf,
-                    up_flag=bool(up_flag),
-                    hook_mgr=hook_mgr,
-                    scale_factor=scale_factor,
-                )
-                png_path = output_dir / f"6layer_anatomy_{seq_dir.name}_frame_{f_idx:04d}.png"
-                render_6layer_anatomy_figure(img, frame_anatomy, png_path)
-                generated_pngs.append(str(png_path))
-
-                probed_frames_metrics.append({
-                    "seq_id": seq_dir.name,
-                    "frame_id": f_idx,
-                    "phase_tag": phase_tag,
-                    "exist": exist_f,
-                    "gt_bbox": frame_anatomy["gt_bbox"],
-                    "pred_bbox": frame_anatomy["pred_bbox"],
-                    "iou": frame_anatomy["iou"],
-                    "confidence": frame_anatomy["confidence"],
-                    "template_updated": frame_anatomy["template_updated"],
-                    "anatomy_figure_png": str(png_path),
-                    "layers": frame_anatomy["metrics"],
-                })
-                print(
-                    f"[6-Layer Probe] 序列 {seq_dir.name} 帧 #{f_idx:04d} ({phase_tag}) 解剖完成 -> {png_path.name} "
-                    f"| Bottleneck: {frame_anatomy['metrics']['root_cause_verdict']['verdict_code']}",
-                    flush=True,
-                )
-
+            pred_xywh = [float(bx[0]), float(bx[1]), float(bx[2] - bx[0] + 1.0), float(bx[3] - bx[1] + 1.0)]
+            gt_f, ex_f = _gt_of(gt_rects, exist_flags, f_idx)
+            iou_f = compute_iou_xyxy(xywh_to_xyxy(pred_xywh), xywh_to_xyxy(gt_f)) if (ex_f == 1 and gt_f[2] > 0 and gt_f[3] > 0) else None
+            if f_idx not in keyframes:
+                continue
+            fa = build_frame_anatomy_from_hook_buffer(seq_dir.name, f_idx, keyframes[f_idx], img, gt_f, ex_f,
+                                                      pred_xywh, iou_f, conf, bool(up_flag), hook_mgr)
+            png = output_dir / f"6layer_anatomy_{seq_dir.name}_frame_{f_idx:04d}.png"
+            render_6layer_anatomy_figure(img, fa, png)
+            pngs.append(str(png))
+            records.append({k: fa[k] for k in ("seq_id", "frame_id", "phase_tag", "exist", "gt_bbox", "pred_bbox", "iou", "confidence", "template_updated")}
+                           | {"anatomy_figure_png": str(png), "layers": fa["metrics"]})
+            print(f"[6-Layer Probe] {seq_dir.name} #{f_idx:04d} ({keyframes[f_idx]}) -> {png.name} | {fa['metrics']['root_cause_verdict']['verdict_code']}", flush=True)
         hook_mgr.remove_hooks()
-
-        summary_json_path = output_dir / f"6layer_metrics_{seq_dir.name}.json"
-        summary_payload = {
+        payload = {
             "seq_id": seq_dir.name,
-            "probe_version": "1.0.0",
+            "probe_version": PROBE_VERSION,
             "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "verified_on_real_model": True,
+            "holdout_guard": holdout_info,
             "onset_frame": onset_frame,
-            "probed_keyframes_count": len(probed_frames_metrics),
-            "generated_anatomy_figures": generated_pngs,
-            "keyframes": probed_frames_metrics,
+            "field_provenance": FIELD_PROVENANCE,
+            "source_constants": {
+                "top_num": SOURCE_TOP_NUM, "iou_reward_thr": SOURCE_IOU_REWARD_THR,
+                "update_score_sum_thr": SOURCE_UPDATE_SCORE_SUM_THR, "update_iou_thr": SOURCE_UPDATE_IOU_THR,
+                "ema_lr_at_init_source": SOURCE_EMA_LR_AT_INIT, "bg_bank_max": SOURCE_BG_BANK_MAX,
+            },
+            "analyst_thresholds": {
+                "update_gt_iou": ANALYST_UPDATE_GT_IOU_THR, "rpn_miss_iou": ANALYST_RPN_MISS_IOU,
+                "rank_inversion_best_iou": ANALYST_RANK_INV_BEST_IOU, "rank_inversion_selected_iou": ANALYST_RANK_INV_SELECTED_IOU,
+            },
+            "probed_keyframes_count": len(records),
+            "generated_anatomy_figures": pngs,
+            "keyframes": records,
         }
-        summary_json_path.write_text(
-            json.dumps(summary_payload, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-        return summary_payload
+        (output_dir / f"6layer_metrics_{seq_dir.name}.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        return payload
     finally:
         os.chdir(orig_cwd)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="SiamDT 六层模块特征分层可视化与量化解剖器")
-    parser.add_argument(
-        "--seq-id",
-        type=str,
-        default="",
-        help="待解剖的序列名称（如 20190925_101846_1_2）",
-    )
-    parser.add_argument(
-        "--seq-dir",
-        type=str,
-        default="",
-        help="序列文件夹完整路径（若不填则自动在 datasets/AntiUAV410/val 下查找 --seq-id）",
-    )
-    parser.add_argument(
-        "--siamdt-dir",
-        type=str,
-        default="/content/runtime/Anti-UAV410/trackers/SiamDT",
-        help="SiamDT 源码运行目录",
-    )
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="configs/siamdt_swin_tiny_sgd.py",
-        help="SiamDT 配置文件相对路径",
-    )
-    parser.add_argument(
-        "--ckpt",
-        type=str,
-        default="checkpoints/siamdt_swin_tiny_sgd.pth",
-        help="SiamDT 权重文件相对路径",
-    )
-    parser.add_argument(
-        "--onset-frame",
-        type=int,
-        default=0,
-        help="指定失败起点帧 t_0（为 0 时自动从遥测或序列中定位）",
-    )
-    parser.add_argument(
-        "--frames",
-        type=str,
-        default="",
-        help="显式指定要解剖的帧号列表，逗号分隔（如 15,22,25,30,40）；留空则自动截取 [-10,-3,0,+5,+15]",
-    )
-    parser.add_argument(
-        "--telemetry-jsonl",
-        type=str,
-        default="",
-        help="可选的已有逐帧遥测 .jsonl 路径（用于自动定位失败起点帧）",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="/content/drive/MyDrive/SiamDT_Project/experiments/failure_diagnosis/feature_anatomy_6layer",
-        help="输出解剖大图与 JSON 指标的目录",
-    )
-    parser.add_argument(
-        "--self-check",
-        action="store_true",
-        help="运行语法与量化解剖逻辑纯标准库自检（无需 GPU 即可核验）",
-    )
-    return parser.parse_args()
+def run_model_smoke(siamdt_dir: Path, seq_dir: Path, output_dir: Path, config_rel: str, ckpt_rel: str,
+                    num_frames: int = 5, holdout_info: Optional[Dict[str, Any]] = None) -> int:
+    """在 Colab GPU 上实例化真实 SiamDTRCNN，跑 num_frames 帧，逐项断言捕获结果非空且形状合理。"""
+    orig_cwd = Path.cwd()
+    seq_dir = seq_dir.resolve()
+    output_dir = output_dir.resolve()
+    checks: List[Dict[str, Any]] = []
 
+    def chk(frame: int, name: str, ok: bool, detail: Any = None) -> None:
+        checks.append({"frame": frame, "check": name, "pass": bool(ok), "detail": detail})
 
-def _run_stdlib_self_check() -> int:
-    """在不依赖第三方重型库的环境下校验关键帧截取与根因判定逻辑。"""
-    kf = select_diagnostic_keyframes(total_frames=200, onset_frame=50)
-    assert len(kf) == 5 and kf[2][0] == 50, f"关键帧截取异常: {kf}"
-    iou_test = compute_iou_xyxy([10, 10, 30, 30], [10, 10, 30, 30])
-    assert abs(iou_test - 1.0) < 1e-6
-    dummy_metrics = {
-        "layer1_backbone": {"mean_target_to_bg_ratio": 1.8},
-        "layer2_fpn": {"per_level": {"P2": {"target_to_bg_activation_ratio": 1.5}, "P4": {"target_to_bg_activation_ratio": 1.2}}},
-        "layer3_ds_rpn": {"xcorr_combined": {"target_vs_strongest_distractor_margin": 0.12}},
-        "layer4_rpn_proposals": {"rpn_recall_iou": 0.72},
-        "layer5_rcnn_top5": {"rcnn_rank_of_best_iou_proposal": 2, "top1_iou": 0.05, "best_top5_iou": 0.68},
-        "layer6_dyn_template_bg_supp": {"template_pollution_triggered": False},
+    env_info: Dict[str, Any] = {}
+    try:
+        import torch
+        env_info = {"torch": torch.__version__, "cuda_available": torch.cuda.is_available(),
+                    "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None}
+        frame_files, gt_rects, exist_flags = _load_sequence(seq_dir)
+        tracker, ops = _build_tracker(siamdt_dir, config_rel, ckpt_rel)
+        hm = SiamDT6LayerHookManager(tracker.model)
+        _init_tracker_on_seq(tracker, ops, frame_files, gt_rects)
+        hm.snapshot_initial_template()
+        chk(0, "initial_template_captured", hm.initial_template_feat is not None,
+            list(hm.initial_template_feat.shape) if hm.initial_template_feat is not None else None)
+        for f_idx in range(1, min(num_frames, len(frame_files) - 1) + 1):
+            hm.clear_frame_buffer()
+            img = ops.read_image(str(frame_files[f_idx]), tracker.color_fmt)
+            img_h, img_w = img.shape[:2]
+            results, up_flag = tracker.update(img, return_all=True)
+            b = hm.frame_buffer
+            st = b["layer1_backbone_stages"]
+            chk(f_idx, "L1_backbone_4_stages_nonempty", len(st) == 4 and all(len(s["shape"]) == 4 and s["shape"][0] == 1 and min(s["shape"][1:]) > 0 for s in st), [s["shape"] for s in st])
+            lv = b["layer2_fpn_levels"]
+            chk(f_idx, "L2_fpn_5_levels_256ch", len(lv) == 5 and all(l["shape"][1] == 256 and min(l["shape"][2:]) > 0 for l in lv), [l["shape"] for l in lv])
+            l3 = b["layer3a_rpn_modulation_levels"]
+            ok3 = all(x is not None for x in l3) and len(lv) == 5 and all(l3[k]["shape"] == lv[k]["shape"] for k in range(5))
+            chk(f_idx, "L3A_proj_out_5_levels_shape_eq_fpn", ok3, [x["shape"] if x else None for x in l3])
+            chk(f_idx, "L3A_proj_out_called_exactly_5_times", b["layer3a_call_count"] == 5, b["layer3a_call_count"])
+            props = b["rpn_proposals_net"] or []
+            chk(f_idx, "L4_proposals_nonempty_5cols", len(props) > 0 and all(len(p) == 5 for p in props[:5]), len(props))
+            main = [c for c in b["layer3b_rcnn_similarity_calls"] if c["phase"] == "rcnn_main"]
+            chk(f_idx, "L3B_rcnn_main_once_shape", len(main) == 1 and main[0]["out_shape"][1:] == [256, 7, 7] and main[0]["out_shape"][0] == len(props),
+                [c["out_shape"] for c in main])
+            bgsim = [c for c in b["layer3b_rcnn_similarity_calls"] if c["phase"] == "bg_matching"]
+            bgc = b["bg_matching_calls"]
+            chk(f_idx, "L3B_bg_matching_5_calls_shape", len(bgsim) == SOURCE_TOP_NUM and all(c["out_shape"][1:] == [256, 7, 7] for c in bgsim)
+                and all(bgsim[i]["out_shape"][0] == bgc[i]["num_bg_rois"] for i in range(min(len(bgsim), len(bgc)))),
+                [c["out_shape"] for c in bgsim])
+            chk(f_idx, "L5_tra_det_nonempty", bool(b["tra_bboxes"]) and bool(b["det_bboxes"]) and len(b["tra_bboxes"][0]) == 5 and len(b["det_bboxes"][0]) == 5,
+                [len(b["tra_bboxes"] or []), len(b["det_bboxes"] or [])])
+            chk(f_idx, "L5_rescale_true", b["simple_test_bboxes_rescale"] is True, b["simple_test_bboxes_rescale"])
+            chk(f_idx, "L5_bg_matching_calls_eq_top_num", len(bgc) == SOURCE_TOP_NUM and all(c["max_score"] is not None for c in bgc),
+                [(c["num_bg_rois"], c["num_returned"]) for c in bgc])
+            fr = b["final_results"] or []
+            chk(f_idx, "L5_final_results_5x5", len(fr) == SOURCE_TOP_NUM and all(len(r) >= 5 for r in fr), len(fr))
+            ret = results.tolist()
+            chk(f_idx, "L5_wrapper_return_identical_to_tracker", [list(r[:5]) for r in ret] == fr)
+            gt_f, ex_f = _gt_of(gt_rects, exist_flags, f_idx)
+            rec = build_layer5_and_6_records(b, gt_f, ex_f)
+            cc = rec["layer5_rcnn_top5"]["capture_consistency"]
+            chk(f_idx, "L5_all_candidates_provenance_matched", cc["all_candidates_provenance_matched"],
+                [c["branch"] for c in rec["layer5_rcnn_top5"]["candidates"]])
+            chk(f_idx, "L5_final_eq_pre_minus_penalty_where_no_iou_partner", cc["final_equals_pre_minus_penalty_on_those_rows"] is not False,
+                {"rows": cc["rows_without_iou_reward_partner"], "result": cc["final_equals_pre_minus_penalty_on_those_rows"]})
+            l6 = rec["layer6_template_update_audit"]
+            chk(f_idx, "L6_source_condition_consistent_with_up_flag", l6["source_condition_consistent_with_up_flag"] is True, l6["source_update_condition"])
+            chk(f_idx, "L6_update_query_called_iff_up_flag", bool(b["update_query_calls"]) == bool(up_flag), [bool(up_flag), len(b["update_query_calls"])])
+            chk(f_idx, "L6_learning_rate_captured", b["learning_rate"] is not None, b["learning_rate"])
+            sf4 = normalize_scale_factor((b["img_meta_x"] or {}).get("scale_factor_raw"))
+            chk(f_idx, "scale_factor_valid", sf4 is not None, sf4)
+            mg = 0.25 * max(img_w, img_h)
+            chk(f_idx, "final_boxes_within_image_bounds", all(-mg <= r[0] <= img_w + mg and -mg <= r[1] <= img_h + mg and -mg <= r[2] <= img_w + mg and -mg <= r[3] <= img_h + mg for r in fr),
+                {"img_wh": [img_w, img_h]})
+            po = boxes_net_to_orig(props[:64], sf4) or []
+            chk(f_idx, "proposals_orig_within_image_bounds", bool(po) and all(-mg <= p[0] and p[2] <= img_w + mg and -mg <= p[1] and p[3] <= img_h + mg for p in po))
+        hm.remove_hooks()
+        chk(-1, "wrappers_removed", all(n not in tracker.model.__dict__ for n in SiamDT6LayerHookManager.WRAPPED_METHODS))
+    except Exception as exc:  # 任何异常都算 smoke 失败，不吞掉
+        import traceback
+        chk(-1, "exception", False, f"{type(exc).__name__}: {exc}\n{traceback.format_exc()[-3000:]}")
+    finally:
+        os.chdir(orig_cwd)
+    passed = bool(checks) and all(c["pass"] for c in checks)
+    report = {
+        "mode": "model_smoke", "probe_version": PROBE_VERSION, "seq_id": seq_dir.name, "num_frames": num_frames,
+        "environment": env_info, "holdout_guard": holdout_info,
+        "result": "PASS" if passed else "FAIL",
+        "num_checks": len(checks), "num_failed": sum(1 for c in checks if not c["pass"]),
+        "failed_checks": [c for c in checks if not c["pass"]],
+        "checks": checks,
     }
-    verdict = diagnose_primary_bottleneck(dummy_metrics)
-    assert verdict["verdict_code"] == "L5_RCNN_RANK_INVERSION"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out = output_dir / f"model_smoke_{seq_dir.name}.json"
+    out.write_text(json.dumps(report, indent=2, ensure_ascii=False, default=str) + "\n", encoding="utf-8")
+    print(json.dumps({k: report[k] for k in ("mode", "seq_id", "environment", "result", "num_checks", "num_failed")} | {"report": str(out), "failed_checks": report["failed_checks"][:10]},
+                     indent=2, ensure_ascii=False, default=str))
+    return 0 if passed else 1
+
+
+# ==============================================================================
+# 7. 离线几何/IO 检查（不加载模型；不代表模型验证）
+# ==============================================================================
+
+def _run_offline_geometry_check() -> int:
+    results: List[Tuple[str, bool]] = []
+
+    def ok(name: str, cond: bool) -> None:
+        results.append((name, bool(cond)))
+
+    ok("iou_identity", abs(compute_iou_xyxy([10, 10, 30, 30], [10, 10, 30, 30]) - 1.0) < 1e-9)
+    ok("iou_disjoint", compute_iou_xyxy([0, 0, 10, 10], [20, 20, 30, 30]) == 0.0)
+    ok("source_computeiou_matches_generic", abs(source_computeiou([0, 0, 10, 10], [5, 5, 15, 15]) - compute_iou_xyxy([0, 0, 10, 10], [5, 5, 15, 15])) < 1e-12)
+    ok("xywh_to_xyxy", xywh_to_xyxy([1, 2, 3, 4]) == [1.0, 2.0, 4.0, 6.0])
+    kf = select_diagnostic_keyframes(total_frames=200, onset_frame=50)
+    ok("keyframes_default", len(kf) == 5 and kf[2] == (50, "Failure Onset [0]"))
+    ok("scale_factor_scalar", normalize_scale_factor(1.5625) == [1.5625] * 4)
+    ok("scale_factor_array4", normalize_scale_factor([2.0, 1.5, 2.0, 1.5]) == [2.0, 1.5, 2.0, 1.5])
+    ok("scale_factor_invalid_is_none", normalize_scale_factor([1.0, 2.0]) is None and normalize_scale_factor(None) is None and normalize_scale_factor(0.0) is None)
+    conv = boxes_net_to_orig([[156.25, 78.125, 312.5, 156.25, 0.9]], [1.5625] * 4)
+    ok("net_to_orig_restore", conv == [[100.0, 50.0, 200.0, 100.0, 0.9]])
+    ok("net_to_orig_none_without_sf", boxes_net_to_orig([[1, 2, 3, 4]], None) is None)
+
+    tra = [[10, 10, 20, 20, 0.95], [50, 50, 60, 60, 0.80], [70, 70, 80, 80, 0.30]]
+    det = [[11, 11, 21, 21, 0.97], [90, 90, 99, 99, 0.60], [50, 50, 60, 60, 0.55]]
+    # 源码排序：0.97(det0) 0.95(tra0) 0.80(tra1) 0.60(det1) 0.55(det2 坐标与 tra1 相同 -> ambiguous)
+    pens = [0.10, 0.20, 0.05, 0.40, 0.05]
+    pre = [0.97, 0.95, 0.80, 0.60, 0.55]
+    final_rows = [[11, 11, 21, 21, None], [10, 10, 20, 20, None], [50, 50, 60, 60, None], [90, 90, 99, 99, None], [50, 50, 60, 60, None]]
+    post = [p - q for p, q in zip(pre, pens)]
+    rewards = [0.0] * 5
+    for i in range(5):
+        for j in range(5):
+            if i != j:
+                v = source_computeiou(final_rows[i][:4], final_rows[j][:4])
+                if v > SOURCE_IOU_REWARD_THR:
+                    rewards[i] += post[j] * v
+    for i in range(5):
+        final_rows[i][4] = post[i] + rewards[i]
+    prov = match_candidate_provenance(final_rows, tra, det)
+    ok("provenance_branches", [p["branch"] for p in prov] == ["detection_branch(det)", "similarity_tracking_branch(tra)",
+                                                              "ambiguous_both_branches", "detection_branch(det)", "ambiguous_both_branches"])
+    ok("provenance_pre_scores_or_null", [p["pre_bg_supp_score"] for p in prov] == [0.97, 0.95, None, 0.60, None])
+    dec = decompose_candidate_scores(final_rows, prov, pens)
+    ok("decompose_identity", all(abs(d["pre_bg_supp_score"] - d["bg_penalty"] + d["iou_reward"] - d["final_score"]) < 1e-9 for d in dec if d["pre_bg_supp_score"] is not None))
+    ok("decompose_null_propagation", dec[2]["post_bg_score"] is None and dec[2]["iou_reward"] is None and dec[2]["final_score"] is not None)
+    ok("decompose_penalty_length_mismatch_gives_null", all(d["bg_penalty"] is None for d in decompose_candidate_scores(final_rows, prov, [0.1, 0.2])))
+    # 行 0/1 的 IoU=0.68（<=0.8，无奖励），行 2/4 坐标相同（IoU=1，互相奖励），行 3 孤立
+    ok("no_partner_rows", rows_without_iou_reward_partner(final_rows) == [0, 1, 3])
+    cond = source_update_condition([[10, 10, 20, 20, 0.96]], [[10, 10, 20, 20, 0.95]])
+    ok("update_condition_met", cond is not None and cond["condition_met"] is True and abs(cond["score_sum"] - 1.91) < 1e-9)
+    cond2 = source_update_condition([[10, 10, 20, 20, 0.96]], [[30, 30, 40, 40, 0.99]])
+    ok("update_condition_not_met_iou", cond2 is not None and cond2["condition_met"] is False)
+    ok("update_condition_empty_is_none", source_update_condition([], [[1, 1, 2, 2, 0.5]]) is None)
+
+    buf = {
+        "img_meta_x": {"scale_factor_raw": 1.5625}, "tra_bboxes": tra, "det_bboxes": det, "final_results": final_rows,
+        "bg_matching_calls": [{"max_score": p, "num_bg_rois": 11} for p in pens], "rpn_proposals_net": [[15.625, 15.625, 31.25, 31.25, 0.9]],
+        "up_flag": False, "update_query_calls": [], "learning_rate": 0.01, "simple_test_bboxes_rescale": True,
+    }
+    rec = build_layer5_and_6_records(buf, [10.0, 10.0, 10.0, 10.0], 1)
+    ok("records_rpn_restored_iou", rec["layer4_rpn_proposals"]["rpn_all_max_iou"] == 1.0)
+    ok("records_selected_is_argmax_final", sum(1 for c in rec["layer5_rcnn_top5"]["candidates"] if c["selected_by_tracker"]) == 1)
+    ok("records_condition_consistency", rec["layer6_template_update_audit"]["source_condition_consistent_with_up_flag"] is True)
+
+    with tempfile.TemporaryDirectory() as td:
+        hj = Path(td) / "holdout_verification.json"
+        hj.write_text(json.dumps({"sequences": ["SEQ_HOLD"]}), encoding="utf-8")
+        refused = False
+        try:
+            enforce_holdout_guard("SEQ_HOLD", unlock_holdout=False, holdout_json=hj)
+        except HoldoutSealedError:
+            refused = True
+        ok("holdout_default_refused", refused)
+        ok("holdout_unlock_allowed", enforce_holdout_guard("SEQ_HOLD", True, hj)["is_holdout"] is True)
+        ok("discovery_allowed", enforce_holdout_guard("SEQ_DISC", False, hj)["is_holdout"] is False)
+        missing_refused = False
+        try:
+            enforce_holdout_guard("SEQ_X", False, Path(td) / "missing.json")
+        except HoldoutSealedError:
+            missing_refused = True
+        ok("holdout_fail_closed_when_manifest_missing", missing_refused)
+
+    # 静态检查：源码中不得残留 v1 的 Gram 相关标识符或字典键（模块 docstring 除外）
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    doc_node = tree.body[0] if tree.body and isinstance(tree.body[0], ast.Expr) else None
+    bad: List[str] = []
+    needle = "".join(["g", "r", "a", "m"])  # 动态拼接，避免检查代码自身命中
+    for node in ast.walk(tree):
+        if node is doc_node or (doc_node is not None and node is getattr(doc_node, "value", None)):
+            continue
+        name = None
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+            name = node.name
+        elif isinstance(node, ast.Name):
+            name = node.id
+        elif isinstance(node, ast.Attribute):
+            name = node.attr
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str) and len(node.value) < 64:
+            name = node.value
+        if name and needle in name.lower():
+            bad.append(name)
+    ok("v1_second_order_matrix_identifiers_removed", not bad)
+
+    passed = all(r for _, r in results)
     print(json.dumps({
-        "self_check": "PASS",
-        "keyframes_sample": kf,
-        "sample_verdict": verdict,
+        "offline_geometry_check": "PASS" if passed else "FAIL",
+        "scope": "仅几何/IO/溯源/护栏纯函数的离线检查（纯标准库）；未加载真实 SiamDTRCNN，未在 GPU 上验证任何 hook。",
+        "num_checks": len(results),
+        "failed": [n for n, r in results if not r],
+        "checks": {n: r for n, r in results},
     }, indent=2, ensure_ascii=False))
-    return 0
+    return 0 if passed else 1
+
+
+# ==============================================================================
+# 8. CLI
+# ==============================================================================
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="SiamDT 六层模块特征解剖器（v2.0，真实路径捕获版）")
+    p.add_argument("--seq-id", type=str, default="", help="序列名（如 20190925_101846_1_2）")
+    p.add_argument("--seq-dir", type=str, default="", help="序列目录完整路径（不填则按 --seq-id 在常见位置查找）")
+    p.add_argument("--siamdt-dir", type=str, default="/content/runtime/Anti-UAV410/trackers/SiamDT", help="SiamDT 源码运行目录")
+    p.add_argument("--config", type=str, default="configs/siamdt_swin_tiny_sgd.py")
+    p.add_argument("--ckpt", type=str, default="checkpoints/siamdt_swin_tiny_sgd.pth")
+    p.add_argument("--onset-frame", type=int, default=0)
+    p.add_argument("--frames", type=str, default="", help="显式帧号列表，逗号分隔")
+    p.add_argument("--telemetry-jsonl", type=str, default="")
+    p.add_argument("--output-dir", type=str, default="/content/drive/MyDrive/SiamDT_Project/experiments/failure_diagnosis/feature_anatomy_6layer")
+    p.add_argument("--holdout-json", type=str, default="", help="holdout_verification.json 路径（默认自动查找；找不到则拒绝执行）")
+    p.add_argument("--unlock-holdout", action="store_true", help="显式解封 Holdout 序列（结果写入独立 HOLDOUT_UNSEALED 目录）")
+    p.add_argument("--offline-geometry-check", action="store_true", help="仅运行几何/IO 纯函数离线检查（不加载模型，不代表模型验证）")
+    p.add_argument("--model-smoke", action="store_true", help="在 GPU 上实例化真实 SiamDTRCNN 跑 1 条序列 5 帧并断言所有捕获点")
+    p.add_argument("--smoke-frames", type=int, default=5)
+    return p.parse_args()
+
+
+def _resolve_seq_dir(args: argparse.Namespace, seq_id: str) -> Path:
+    if args.seq_dir:
+        return Path(args.seq_dir)
+    for cand in (Path(f"/content/runtime/datasets/AntiUAV410/val/{seq_id}"),
+                 Path(f"/content/drive/MyDrive/SiamDT_Project/datasets/AntiUAV410/val/{seq_id}")):
+        if cand.exists():
+            return cand
+    return Path(f"/content/drive/MyDrive/SiamDT_Project/datasets/AntiUAV410/val/{seq_id}")
 
 
 def main() -> None:
     args = parse_args()
-    if args.self_check:
-        sys.exit(_run_stdlib_self_check())
+    if args.offline_geometry_check:
+        sys.exit(_run_offline_geometry_check())
 
-    if not args.seq_dir and not args.seq_id:
-        print("错误: 请提供 --seq-id 或 --seq-dir，或使用 --self-check 运行自检。", file=sys.stderr)
+    seq_id = args.seq_id or (Path(args.seq_dir).name if args.seq_dir else "")
+    if not seq_id and args.model_smoke:
+        seq_id = load_discovery_first_sequence() or ""
+    if not seq_id:
+        print("错误: 请提供 --seq-id 或 --seq-dir（或使用 --offline-geometry-check / --model-smoke）。", file=sys.stderr)
         sys.exit(2)
+    seq_dir = _resolve_seq_dir(args, seq_id)
+    try:
+        holdout_info = enforce_holdout_guard(seq_dir.name, args.unlock_holdout, Path(args.holdout_json) if args.holdout_json else None)
+    except HoldoutSealedError as exc:
+        print(f"[Holdout 封存] {exc}", file=sys.stderr)
+        sys.exit(3)
+    out_root = Path(args.output_dir)
+    if holdout_info.get("is_holdout") or holdout_info.get("holdout_check") == "UNVERIFIED_UNLOCKED":
+        out_root = out_root / "HOLDOUT_UNSEALED"
 
-    seq_dir = Path(args.seq_dir) if args.seq_dir else Path(
-        f"/content/drive/MyDrive/SiamDT_Project/datasets/AntiUAV410/val/{args.seq_id}"
-    )
-    if not seq_dir.exists():
-        alt = Path(f"/content/runtime/datasets/AntiUAV410/val/{args.seq_id}")
-        if alt.exists():
-            seq_dir = alt
+    if args.model_smoke:
+        sys.exit(run_model_smoke(Path(args.siamdt_dir), seq_dir, out_root / "_model_smoke", args.config, args.ckpt,
+                                 num_frames=args.smoke_frames, holdout_info=holdout_info))
 
-    explicit_frames = (
-        [int(x.strip()) for x in args.frames.split(",") if x.strip()]
-        if args.frames.strip()
-        else None
-    )
-    telemetry_path = Path(args.telemetry_jsonl) if args.telemetry_jsonl else None
-
+    explicit = [int(x.strip()) for x in args.frames.split(",") if x.strip()] if args.frames.strip() else None
     summary = run_live_siamdt_probe_on_sequence(
-        siamdt_dir=Path(args.siamdt_dir),
-        seq_dir=seq_dir,
-        output_dir=Path(args.output_dir) / seq_dir.name,
-        config_rel=args.config,
-        ckpt_rel=args.ckpt,
-        onset_frame=args.onset_frame,
-        explicit_frames=explicit_frames,
-        telemetry_jsonl=telemetry_path,
+        siamdt_dir=Path(args.siamdt_dir), seq_dir=seq_dir, output_dir=out_root / seq_dir.name,
+        config_rel=args.config, ckpt_rel=args.ckpt, onset_frame=args.onset_frame, explicit_frames=explicit,
+        telemetry_jsonl=Path(args.telemetry_jsonl) if args.telemetry_jsonl else None, holdout_info=holdout_info,
     )
-    print(json.dumps({
-        "status": "COMPLETED",
-        "seq_id": summary["seq_id"],
-        "probed_keyframes_count": summary["probed_keyframes_count"],
-        "generated_anatomy_figures": summary["generated_anatomy_figures"],
-    }, indent=2, ensure_ascii=False))
+    print(json.dumps({"status": "COMPLETED", "seq_id": summary["seq_id"], "probed_keyframes_count": summary["probed_keyframes_count"],
+                      "generated_anatomy_figures": summary["generated_anatomy_figures"]}, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":

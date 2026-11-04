@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SimDT 围点打援 —— 本地总控遥控客户端 (Local Colab Remote Controller)
+SimDT 围点打援 —— 本地总控遥控客户端 v2.0 (Local Colab Remote Controller，2026-11-04 修订)
 ====================================================================
-供本地总控 AI 直接调用，全自动控制远端 Google Colab A100/L4 服务器：
-1. `--action ping`:
-   检查 `Z:\\SiamDT_Project\\colab\\bridge\\heartbeat.json`，判断 Colab 是否在线、GPU 型号（A100/L4）、
-   显存与磁盘空间、心跳距今秒数、以及是否有可用直连 `tunnel_url`。
-2. `--action exec --cmd "<shell command>" --wait`:
-   - 优先尝试通过 `heartbeat.json` 中的 `tunnel_url` (通道 B: Cloudflare HTTP 隧道) 直接下发命令并实时流式拉取 `/logs`；
-   - 若无 `tunnel_url` 或直连超时，自动无缝切换至 通道 A (Google Drive 文件队列)，向 `cmd_queue/` 投递 `{cmd_id}.cmd.json`，
-     并实时轮询流式打印 `cmd_results/{cmd_id}.log` 直至拿到 `cmd_results/{cmd_id}.result.json` 回执！
-3. `--action status --cmd-id <cmd_id>`:
-   查询指定任务的状态与日志尾部输出。
+与 colab_remote_bridge.py v2.0 配套，默认只走 Google Drive 文件队列通道，只能下发白名单动作：
+
+本地动作：
+  --action ping          读取 heartbeat.json，判断在线（默认心跳年龄 <= 180 s 视为在线）
+  --action result        查询某个 cmd_id 的状态/结果与日志尾部（--cmd-id）
+  --action stop-bridge   在 bridge 目录写入 STOP_BRIDGE 标志，远端桥会停止并退出
+远端白名单动作（投递到 cmd_queue/）：
+  status | tail_log | cancel | setup_env | stage_assets | run_phase2 | run_probe | extract_episodes | raw_shell(需远端 --allow-raw-shell)
+
+示例：
+  python local_colab_controller.py --action status --wait
+  python local_colab_controller.py --action run_phase2 --wait --timeout-min 720 -- --action evaluate --split discovery_set
+  python local_colab_controller.py --action tail_log --param cmd_id=cmd_20261104_xxx --param lines=200 --wait
+所有等待均按分钟级设计（Drive 同步延迟通常为数十秒到数分钟）。
 """
 
 from __future__ import annotations
@@ -21,14 +25,13 @@ import argparse
 import json
 import os
 import secrets
-import socket
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -36,6 +39,14 @@ if hasattr(sys.stdout, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
+
+CONTROLLER_VERSION = "2.0.0"
+DEFAULT_MAX_AGE_SEC = 180.0
+DEFAULT_POLL_SEC = 10.0
+DEFAULT_PICKUP_TIMEOUT_MIN = 10.0
+REMOTE_ACTIONS = ("status", "tail_log", "cancel", "setup_env", "stage_assets", "run_phase2", "run_probe", "extract_episodes", "raw_shell")
+LOCAL_ACTIONS = ("ping", "result", "stop-bridge")
+BUILTIN_REMOTE = ("status", "tail_log", "cancel")
 
 
 def resolve_default_bridge_dir() -> Path:
@@ -45,378 +56,242 @@ def resolve_default_bridge_dir() -> Path:
     env_drive = os.environ.get("SIAMDT_DRIVE_ROOT", "").strip()
     if env_drive:
         return Path(env_drive) / "colab" / "bridge"
-    for cand in (
-        Path(r"Z:\SiamDT_Project\colab\bridge"),
-        Path(r"G:\我的云端硬盘\SiamDT_Project\colab\bridge"),
-        Path("/content/drive/MyDrive/SiamDT_Project/colab/bridge"),
-    ):
+    for cand in (Path(r"Z:\SiamDT_Project\colab\bridge"), Path(r"G:\我的云端硬盘\SiamDT_Project\colab\bridge"),
+                 Path("/content/drive/MyDrive/SiamDT_Project/colab/bridge")):
         if cand.parent.exists():
             return cand
     return Path(r"Z:\SiamDT_Project\colab\bridge")
 
 
+def refresh_dir(path: Path) -> None:
+    """先 os.listdir 父目录以刷新元数据（Drive for Desktop 下否则可能看不到新文件）。"""
+    try:
+        os.listdir(path)
+    except Exception:
+        pass
+
+
 def atomic_fsync_write_json(target_path: Path, payload: Dict[str, Any]) -> None:
     target_path.parent.mkdir(parents=True, exist_ok=True)
     content = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
-    tmp_path = target_path.with_suffix(target_path.suffix + ".tmp")
-    try:
-        with tmp_path.open("w", encoding="utf-8") as f:
-            f.write(content)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(str(tmp_path), str(target_path))
-    except Exception:
-        with target_path.open("w", encoding="utf-8") as f:
-            f.write(content)
-            f.flush()
-            os.fsync(f.fileno())
+    tmp_path = target_path.with_name(target_path.name + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(str(tmp_path), str(target_path))
 
 
-def read_heartbeat(bridge_dir: Path) -> Optional[Dict[str, Any]]:
-    hb_file = bridge_dir / "heartbeat.json"
-    if not hb_file.exists():
+def read_json_file(path: Path) -> Optional[Dict[str, Any]]:
+    refresh_dir(path.parent)
+    if not path.exists():
         return None
     for _ in range(3):
         try:
-            text = hb_file.read_text(encoding="utf-8").strip()
+            text = path.read_text(encoding="utf-8").strip()
             if text:
                 return json.loads(text)
         except Exception:
-            time.sleep(0.15)
+            time.sleep(0.5)
     return None
 
 
-def http_json_request(
-    url: str,
-    token: str,
-    method: str = "GET",
-    payload: Optional[Dict[str, Any]] = None,
-    timeout: float = 5.0,
-) -> Tuple[bool, Optional[Dict[str, Any]], str]:
-    headers = {
-        "X-Bridge-Token": token,
-        "Accept": "application/json",
-    }
-    data_bytes = None
-    if payload is not None:
-        data_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        headers["Content-Type"] = "application/json; charset=utf-8"
+def heartbeat_state(bridge_dir: Path, max_age_sec: float) -> Dict[str, Any]:
+    hb = read_json_file(bridge_dir / "heartbeat.json")
+    if hb is None:
+        return {"online": False, "reason": f"未找到心跳文件 {bridge_dir / 'heartbeat.json'}（请在 Colab 运行 Cell 0）", "heartbeat": None}
+    age = round(max(0.0, time.time() - float(hb.get("timestamp_epoch") or 0.0)), 1)
+    status = str(hb.get("status", "ONLINE"))
+    online = age <= max_age_sec and status == "ONLINE"
+    return {"online": online, "heartbeat_age_sec": age, "max_allowed_age_sec": max_age_sec, "bridge_status": status, "heartbeat": hb}
 
-    req = urllib.request.Request(url, data=data_bytes, headers=headers, method=method)
+
+def action_ping(bridge_dir: Path, max_age_sec: float) -> int:
+    st = heartbeat_state(bridge_dir, max_age_sec)
+    hb = st.get("heartbeat") or {}
+    report = {k: v for k, v in st.items() if k != "heartbeat"}
+    report.update({k: hb.get(k) for k in ("bridge_version", "gpu_name", "gpu_tier", "vram_total_mb", "vram_used_mb", "drive_free_gb",
+                                          "runtime_disk_free_gb", "channels_active", "tunnel_enabled", "raw_shell_enabled",
+                                          "allowed_actions", "active_cmd_id", "active_action", "processed_cmd_count",
+                                          "timestamp_utc", "heartbeat_interval_sec")})
+    report["bridge_dir"] = str(bridge_dir)
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+    return 0 if st["online"] else 2
+
+
+def http_json(url: str, token: str, method: str = "GET", payload: Optional[Dict[str, Any]] = None, timeout: float = 30.0) -> Tuple[int, Optional[Dict[str, Any]]]:
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={"X-Bridge-Token": token, "Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            return True, json.loads(raw), ""
-    except Exception as exc:
-        return False, None, str(exc)
+            return resp.status, json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read().decode("utf-8", "replace"))
+        except Exception:
+            return e.code, None
+    except Exception:
+        return -1, None
 
 
-def action_ping(bridge_dir: Path, max_age_sec: float = 45.0, check_http: bool = True) -> int:
-    hb = read_heartbeat(bridge_dir)
-    if hb is None:
-        report = {
-            "online": False,
-            "reason": f"未找到心跳文件: {bridge_dir / 'heartbeat.json'} (请在 Colab 中点击 Cell 0 启动远程接管桥)",
-            "bridge_dir": str(bridge_dir),
-        }
-        print(json.dumps(report, indent=2, ensure_ascii=False))
-        return 1
-
-    now = time.time()
-    hb_epoch = float(hb.get("timestamp_epoch") or 0.0)
-    age_sec = round(max(0.0, now - hb_epoch), 2)
-    is_fresh = age_sec <= max_age_sec
-
-    tunnel_url = str(hb.get("tunnel_url") or "").strip()
-    http_listen = str(hb.get("http_listen") or "").strip()
-    token = str(hb.get("bridge_token") or "").strip()
-    same_host = (str(hb.get("hostname") or "") == socket.gethostname())
-
-    direct_endpoint = ""
-    direct_reachable = False
-    if check_http and token:
-        url_candidates = [tunnel_url] if not same_host else [tunnel_url, http_listen]
-        for base_url in [u for u in url_candidates if u]:
-            ok, data, _ = http_json_request(f"{base_url.rstrip('/')}/status", token=token, method="GET", timeout=3.0)
-            if ok and isinstance(data, dict):
-                direct_endpoint = base_url.rstrip("/")
-                direct_reachable = True
-                break
-
-    report = {
-        "online": bool(is_fresh or direct_reachable),
-        "heartbeat_fresh": is_fresh,
-        "heartbeat_age_sec": age_sec,
-        "max_allowed_age_sec": max_age_sec,
-        "gpu_name": hb.get("gpu_name", "UNKNOWN"),
-        "gpu_tier": hb.get("gpu_tier", "UNKNOWN"),
-        "vram_total_mb": hb.get("vram_total_mb", 0.0),
-        "vram_used_mb": hb.get("vram_used_mb", 0.0),
-        "vram_free_mb": hb.get("vram_free_mb", 0.0),
-        "drive_free_gb": hb.get("drive_free_gb", 0.0),
-        "runtime_disk_free_gb": hb.get("runtime_disk_free_gb", 0.0),
-        "tunnel_url": tunnel_url,
-        "direct_http_endpoint": direct_endpoint,
-        "direct_http_reachable": direct_reachable,
-        "channels_active": hb.get("channels_active", ["GDRIVE_FILE_QUEUE"]),
-        "active_cmd_id": hb.get("active_cmd_id"),
-        "processed_cmd_count": hb.get("processed_cmd_count", 0),
-        "hostname": hb.get("hostname"),
-        "pid": hb.get("pid"),
-        "heartbeat_timestamp_utc": hb.get("timestamp_utc"),
-        "bridge_dir": str(bridge_dir),
-    }
-    print(json.dumps(report, indent=2, ensure_ascii=False))
-    return 0 if report["online"] else 2
-
-
-def _exec_via_http_endpoint(
-    base_url: str,
-    token: str,
-    spec: Dict[str, Any],
-    wait: bool,
-    poll_interval: float,
-) -> Tuple[bool, Optional[Dict[str, Any]]]:
-    cmd_id = spec["cmd_id"]
-    payload = dict(spec)
-    payload["async"] = True
-    ok, resp, err = http_json_request(
-        f"{base_url.rstrip('/')}/exec",
-        token=token,
-        method="POST",
-        payload=payload,
-        timeout=6.0,
-    )
-    if not ok or not resp or not resp.get("accepted"):
-        return False, None
-
-    print(f"[Controller] 已通过直连 HTTP 通道 ({base_url}) 投递指令: {cmd_id}", flush=True)
-    if not wait:
-        return True, resp
-
+def _poll_results(bridge_dir: Path, cmd_id: str, wait_timeout_sec: float, pickup_timeout_sec: float, poll_sec: float) -> Dict[str, Any]:
+    results_dir = bridge_dir / "cmd_results"
+    log_p, status_p, res_p = (results_dir / f"{cmd_id}.log", results_dir / f"{cmd_id}.status.json", results_dir / f"{cmd_id}.result.json")
+    t0 = time.time()
     offset = 0
-    t0 = time.time()
-    timeout_sec = float(spec.get("timeout_sec") or 3600.0)
+    picked = False
     while True:
-        qs = urllib.parse.urlencode({"cmd_id": cmd_id, "offset": offset})
-        ok_log, log_data, _ = http_json_request(
-            f"{base_url.rstrip('/')}/logs?{qs}",
-            token=token,
-            method="GET",
-            timeout=6.0,
-        )
-        if not ok_log or not isinstance(log_data, dict):
-            # 若 HTTP 隧道中途波动，交由调用方无缝回退至 Google Drive 文件轮询
-            return False, None
-        chunk = log_data.get("log_chunk") or ""
-        if chunk:
-            sys.stdout.write(chunk)
-            sys.stdout.flush()
-        offset = int(log_data.get("next_offset") or offset)
-        if log_data.get("finished") and isinstance(log_data.get("result"), dict):
-            return True, log_data["result"]
-        if (time.time() - t0) > (timeout_sec + 30.0):
-            return False, None
-        time.sleep(poll_interval)
-
-
-def _poll_gdrive_results(
-    bridge_dir: Path,
-    cmd_id: str,
-    timeout_sec: float,
-    poll_interval: float,
-    initial_offset: int = 0,
-) -> Dict[str, Any]:
-    results_dir = bridge_dir / "cmd_results"
-    log_path = results_dir / f"{cmd_id}.log"
-    res_path = results_dir / f"{cmd_id}.result.json"
-
-    offset = initial_offset
-    t0 = time.time()
-
-    while True:
-        if log_path.exists():
+        refresh_dir(results_dir)
+        if log_p.exists():
+            picked = True
             try:
-                raw_bytes = log_path.read_bytes()
-                if offset < len(raw_bytes):
-                    chunk = raw_bytes[offset:].decode("utf-8", errors="replace")
-                    sys.stdout.write(chunk)
+                raw = log_p.read_bytes()
+                if offset < len(raw):
+                    sys.stdout.write(raw[offset:].decode("utf-8", "replace"))
                     sys.stdout.flush()
-                    offset = len(raw_bytes)
+                    offset = len(raw)
             except Exception:
                 pass
-
-        if res_path.exists():
+        if status_p.exists():
+            picked = True
+        res = read_json_file(res_p)
+        if res is not None:
             try:
-                res_text = res_path.read_text(encoding="utf-8").strip()
-                if res_text:
-                    res_obj = json.loads(res_text)
-                    # 再读一次确保尾部日志全部打出
-                    if log_path.exists():
-                        raw_bytes = log_path.read_bytes()
-                        if offset < len(raw_bytes):
-                            sys.stdout.write(raw_bytes[offset:].decode("utf-8", errors="replace"))
-                            sys.stdout.flush()
-                    return res_obj
+                raw = log_p.read_bytes() if log_p.exists() else b""
+                if offset < len(raw):
+                    sys.stdout.write(raw[offset:].decode("utf-8", "replace"))
             except Exception:
                 pass
-
-        if (time.time() - t0) > (timeout_sec + 60.0):
-            return {
-                "cmd_id": cmd_id,
-                "status": "CONTROLLER_WAIT_TIMEOUT",
-                "returncode": -99,
-                "elapsed_sec": round(time.time() - t0, 2),
-                "error": f"等待 Google Drive 回执超时 ({timeout_sec}s): {res_path}",
-            }
-
-        time.sleep(poll_interval)
+            return res
+        elapsed = time.time() - t0
+        if not picked and elapsed > pickup_timeout_sec:
+            return {"cmd_id": cmd_id, "status": "CONTROLLER_PICKUP_TIMEOUT", "returncode": 3,
+                    "error": f"{pickup_timeout_sec / 60:.1f} 分钟内远端未接收（可能离线或 Drive 同步延迟）；指令仍在队列中，可稍后用 --action result 查询"}
+        if elapsed > wait_timeout_sec:
+            return {"cmd_id": cmd_id, "status": "CONTROLLER_WAIT_TIMEOUT", "returncode": 4,
+                    "error": f"等待超过 {wait_timeout_sec / 60:.1f} 分钟；远端可能仍在运行，可稍后用 --action result 查询"}
+        time.sleep(poll_sec)
 
 
-def action_exec(
-    bridge_dir: Path,
-    command: str,
-    cwd: str = "",
-    timeout_sec: float = 3600.0,
-    wait: bool = True,
-    prefer_channel: str = "auto",
-    poll_interval: float = 1.0,
-    cmd_id: str = "",
-) -> int:
+def action_submit(bridge_dir: Path, args: argparse.Namespace, remote_args: List[str]) -> int:
+    action = args.action
+    params: Dict[str, str] = {}
+    for kv in args.param or []:
+        if "=" not in kv:
+            print(f"错误: --param 需为 key=value 形式: {kv}", file=sys.stderr)
+            return 2
+        k, v = kv.split("=", 1)
+        params[k.strip()] = v
+    if action == "raw_shell" and not args.cmd.strip():
+        print("错误: raw_shell 需要 --cmd（且远端必须以 --allow-raw-shell 启动）", file=sys.stderr)
+        return 2
+    cmd_id = args.cmd_id.strip() or f"cmd_{time.strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(3)}"
+    spec: Dict[str, Any] = {"cmd_id": cmd_id, "action": action, "args": remote_args, "params": params,
+                            "created_at": time.time(), "controller_version": CONTROLLER_VERSION}
+    if args.timeout_min is not None:
+        spec["timeout_sec"] = float(args.timeout_min) * 60.0
+    if action == "raw_shell":
+        spec["command"] = args.cmd
+
+    st = heartbeat_state(bridge_dir, args.max_age_sec)
+    if not st["online"]:
+        print(f"[Controller-警告] 远端当前不在线（{st.get('reason') or ('心跳年龄 %ss' % st.get('heartbeat_age_sec'))}），指令将留在队列中等待桥上线。", flush=True)
+
+    hb = st.get("heartbeat") or {}
+    if args.prefer_channel == "tunnel" or (args.prefer_channel == "auto" and hb.get("tunnel_url")):
+        url, token = str(hb.get("tunnel_url") or ""), str(hb.get("bridge_token") or "")
+        if url and token:
+            code, resp = http_json(f"{url.rstrip('/')}/exec", token, "POST", spec)
+            if code in (200, 202):
+                print(f"[Controller] 已通过隧道投递 {cmd_id}（state={resp.get('state') if resp else None}）", flush=True)
+                if code == 200 or not args.wait:
+                    print(json.dumps(resp, ensure_ascii=False, indent=2))
+                    return int(((resp or {}).get("result") or {}).get("returncode", 0))
+        if args.prefer_channel == "tunnel":
+            print("[Controller] 隧道不可用（默认关闭），改用 Drive 队列。", flush=True)
+
     queue_dir = bridge_dir / "cmd_queue"
-    results_dir = bridge_dir / "cmd_results"
-    queue_dir.mkdir(parents=True, exist_ok=True)
-    results_dir.mkdir(parents=True, exist_ok=True)
-
-    resolved_cmd_id = cmd_id.strip() or f"cmd_{time.strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(3)}"
-    spec: Dict[str, Any] = {
-        "cmd_id": resolved_cmd_id,
-        "command": command,
-        "cwd": cwd if cwd else None,
-        "timeout_sec": timeout_sec,
-        "created_at": time.time(),
-    }
-
-    # 1. 若允许使用直连隧道 (auto 或 tunnel)，优先尝试 HTTP 通道
-    hb = read_heartbeat(bridge_dir)
-    if prefer_channel in ("auto", "tunnel") and hb is not None:
-        token = str(hb.get("bridge_token") or "").strip()
-        tunnel_url = str(hb.get("tunnel_url") or "").strip()
-        http_listen = str(hb.get("http_listen") or "").strip()
-        same_host = (str(hb.get("hostname") or "") == socket.gethostname())
-        candidates = [u for u in ([tunnel_url] if not same_host else [tunnel_url, http_listen]) if u]
-        for endpoint in candidates:
-            ok, res_obj = _exec_via_http_endpoint(
-                base_url=endpoint,
-                token=token,
-                spec=spec,
-                wait=wait,
-                poll_interval=poll_interval,
-            )
-            if ok and res_obj is not None:
-                print("\n[Controller-Result] " + json.dumps(res_obj, ensure_ascii=False))
-                return int(res_obj.get("returncode", 0)) if wait else 0
-
-    # 2. 通道 A：向 Google Drive 文件夹队列写入 {cmd_id}.cmd.json
-    cmd_file = queue_dir / f"{resolved_cmd_id}.cmd.json"
+    cmd_file = queue_dir / f"{cmd_id}.cmd.json"
     atomic_fsync_write_json(cmd_file, spec)
-    print(f"[Controller] 已向 Google Drive 队列投递指令: {cmd_file}", flush=True)
-
-    if not wait:
-        print(json.dumps({"submitted": True, "cmd_id": resolved_cmd_id, "cmd_file": str(cmd_file)}, ensure_ascii=False))
+    print(f"[Controller] 已投递到 Drive 队列: {cmd_file}", flush=True)
+    if not args.wait:
+        print(json.dumps({"submitted": True, "cmd_id": cmd_id, "cmd_file": str(cmd_file)}, ensure_ascii=False))
         return 0
-
-    res_obj = _poll_gdrive_results(
-        bridge_dir=bridge_dir,
-        cmd_id=resolved_cmd_id,
-        timeout_sec=timeout_sec,
-        poll_interval=poll_interval,
-    )
-    print("\n[Controller-Result] " + json.dumps(res_obj, ensure_ascii=False))
-    return int(res_obj.get("returncode", 1))
-
-
-def action_status(bridge_dir: Path, cmd_id: str) -> int:
-    results_dir = bridge_dir / "cmd_results"
-    res_file = results_dir / f"{cmd_id}.result.json"
-    status_file = results_dir / f"{cmd_id}.status.json"
-    log_file = results_dir / f"{cmd_id}.log"
-
-    payload: Dict[str, Any] = {"cmd_id": cmd_id, "bridge_dir": str(bridge_dir)}
-    if res_file.exists():
-        payload["result"] = json.loads(res_file.read_text(encoding="utf-8"))
-    elif status_file.exists():
-        payload["status_info"] = json.loads(status_file.read_text(encoding="utf-8"))
+    if args.wait_timeout_min is not None:
+        wait_min = float(args.wait_timeout_min)
+    elif action in BUILTIN_REMOTE:
+        wait_min = 15.0
     else:
-        payload["status"] = "PENDING_OR_NOT_FOUND"
+        wait_min = (float(args.timeout_min) if args.timeout_min is not None else 60.0) + 10.0
+    res = _poll_results(bridge_dir, cmd_id, wait_min * 60.0, float(args.pickup_timeout_min) * 60.0, float(args.poll_interval))
+    print("\n[Controller-Result] " + json.dumps({k: v for k, v in res.items() if k != "tail_output"}, ensure_ascii=False))
+    return int(res.get("returncode", 1))
 
-    if log_file.exists():
-        text = log_file.read_text(encoding="utf-8", errors="replace")
-        payload["log_tail"] = text[-2000:]
+
+def action_result(bridge_dir: Path, cmd_id: str) -> int:
+    results_dir = bridge_dir / "cmd_results"
+    payload: Dict[str, Any] = {"cmd_id": cmd_id, "bridge_dir": str(bridge_dir)}
+    res = read_json_file(results_dir / f"{cmd_id}.result.json")
+    st = read_json_file(results_dir / f"{cmd_id}.status.json")
+    if res is not None:
+        payload["result"] = res
+    elif st is not None:
+        payload["status_info"] = st
+    else:
+        refresh_dir(bridge_dir / "cmd_queue")
+        payload["status"] = "QUEUED" if (bridge_dir / "cmd_queue" / f"{cmd_id}.cmd.json").exists() else "NOT_FOUND"
+    log_p = results_dir / f"{cmd_id}.log"
+    if log_p.exists():
+        payload["log_tail"] = log_p.read_text(encoding="utf-8", errors="replace")[-2000:]
     print(json.dumps(payload, indent=2, ensure_ascii=False))
     return 0
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="SimDT 本地总控 Colab 遥控客户端")
-    parser.add_argument(
-        "--action",
-        type=str,
-        required=True,
-        choices=["ping", "exec", "status"],
-        help="执行动作: ping (检查心跳与GPU状态) | exec (投递并执行远程命令) | status (查询任务状态)",
-    )
-    parser.add_argument(
-        "--bridge-dir",
-        type=str,
-        default="",
-        help="网桥目录路径 (默认 Z:\\SiamDT_Project\\colab\\bridge)",
-    )
-    parser.add_argument("--cmd", type=str, default="", help="--action exec 时要执行的 Shell 命令")
-    parser.add_argument("--cwd", type=str, default="", help="远程命令工作目录 (可选)")
-    parser.add_argument("--timeout", type=float, default=3600.0, help="远程命令超时秒数")
-    parser.add_argument("--wait", action="store_true", help="等待远程命令执行完成并实时流式打印日志")
-    parser.add_argument(
-        "--prefer-channel",
-        type=str,
-        default="auto",
-        choices=["auto", "tunnel", "gdrive"],
-        help="通道偏好: auto (优先隧道，失败自动回退 Google Drive 队列) | tunnel | gdrive",
-    )
-    parser.add_argument("--cmd-id", type=str, default="", help="指定或查询的 cmd_id")
-    parser.add_argument("--max-age-sec", type=float, default=45.0, help="ping 判定在线的最大心跳年龄(秒)")
-    parser.add_argument("--poll-interval", type=float, default=0.8, help="轮询日志间隔(秒)")
-    return parser.parse_args()
+def action_stop_bridge(bridge_dir: Path) -> int:
+    flag = bridge_dir / "STOP_BRIDGE"
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.write_text(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + " stop requested by local controller\n", encoding="utf-8")
+    print(json.dumps({"stop_flag_written": str(flag), "note": "远端桥在下一次轮询（Drive 同步后）检测到标志即退出；运行中的任务会被终止"},
+                     ensure_ascii=False, indent=2))
+    return 0
+
+
+def parse_args() -> Tuple[argparse.Namespace, List[str]]:
+    p = argparse.ArgumentParser(description="SimDT 本地总控 Colab 遥控客户端 v2.0（白名单动作 + Drive 队列）")
+    p.add_argument("--action", required=True, choices=list(LOCAL_ACTIONS) + list(REMOTE_ACTIONS))
+    p.add_argument("--bridge-dir", type=str, default="")
+    p.add_argument("--wait", action="store_true", help="等待远端结果并实时打印日志")
+    p.add_argument("--timeout-min", type=float, default=None, help="远端任务超时（分钟；默认按动作：setup_env 60、stage_assets 120、run_phase2 720、run_probe 180、extract_episodes 60）")
+    p.add_argument("--wait-timeout-min", type=float, default=None, help="本地等待上限（分钟；默认 内建动作 15，脚本动作 timeout+10）")
+    p.add_argument("--pickup-timeout-min", type=float, default=DEFAULT_PICKUP_TIMEOUT_MIN, help="远端未接收的判定时间（分钟，默认 10）")
+    p.add_argument("--poll-interval", type=float, default=DEFAULT_POLL_SEC, help="轮询间隔秒（默认 10）")
+    p.add_argument("--max-age-sec", type=float, default=DEFAULT_MAX_AGE_SEC, help="心跳在线阈值秒（默认 180）")
+    p.add_argument("--prefer-channel", choices=["auto", "gdrive", "tunnel"], default="gdrive",
+                   help="默认 gdrive；auto 仅在远端显式开启隧道时才走隧道")
+    p.add_argument("--param", action="append", help="内建动作参数 key=value（如 tail_log: cmd_id=... / path=... / lines=200；cancel: cmd_id=...）")
+    p.add_argument("--cmd", type=str, default="", help="仅 raw_shell 使用")
+    p.add_argument("--cmd-id", type=str, default="", help="指定/查询的 cmd_id")
+    argv = sys.argv[1:]
+    remote_args: List[str] = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, remote_args = argv[:i], argv[i + 1:]
+    return p.parse_args(argv), remote_args
 
 
 def main() -> None:
-    args = parse_args()
+    args, remote_args = parse_args()
     bridge_dir = Path(args.bridge_dir) if args.bridge_dir else resolve_default_bridge_dir()
-
     if args.action == "ping":
-        rc = action_ping(bridge_dir=bridge_dir, max_age_sec=args.max_age_sec)
-        sys.exit(rc)
-    elif args.action == "exec":
-        if not args.cmd.strip():
-            print("错误: --action exec 必须提供 --cmd 参数", file=sys.stderr)
-            sys.exit(2)
-        rc = action_exec(
-            bridge_dir=bridge_dir,
-            command=args.cmd,
-            cwd=args.cwd,
-            timeout_sec=args.timeout,
-            wait=args.wait,
-            prefer_channel=args.prefer_channel,
-            poll_interval=args.poll_interval,
-            cmd_id=args.cmd_id,
-        )
-        sys.exit(rc)
-    elif args.action == "status":
+        sys.exit(action_ping(bridge_dir, args.max_age_sec))
+    if args.action == "result":
         if not args.cmd_id.strip():
-            print("错误: --action status 必须提供 --cmd-id 参数", file=sys.stderr)
+            print("错误: --action result 需要 --cmd-id", file=sys.stderr)
             sys.exit(2)
-        rc = action_status(bridge_dir=bridge_dir, cmd_id=args.cmd_id.strip())
-        sys.exit(rc)
+        sys.exit(action_result(bridge_dir, args.cmd_id.strip()))
+    if args.action == "stop-bridge":
+        sys.exit(action_stop_bridge(bridge_dir))
+    sys.exit(action_submit(bridge_dir, args, remote_args))
 
 
 if __name__ == "__main__":

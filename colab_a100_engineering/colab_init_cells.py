@@ -12,12 +12,14 @@ SimDT 围点打援 (SiamDT + Multi-Tracker Benchmark on Anti-UAV410)
 """
 
 # ==============================================================================
-# [CELL 0] 一键开启本地总控远程接管模式 (Colab Remote Bridge)
+# [CELL 0] 后台启动远程接管桥（仅 Google Drive 文件队列通道；不开公网隧道；立即返回）
 # ==============================================================================
 CELL_0_REMOTE_BRIDGE = r'''
+import hashlib
 import os
-import runpy
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 try:
@@ -25,13 +27,116 @@ try:
     if not os.path.ismount('/content/drive'):
         drive.mount('/content/drive')
 except ImportError:
-    print("[提示] 当前非 Google Colab 交互环境，跳过 drive.mount。")
+    print('[提示] 当前非 Google Colab 交互环境，跳过 drive.mount。')
 
-DRIVE_ROOT = Path(os.environ.get("SIAMDT_DRIVE_ROOT", "/content/drive/MyDrive/SiamDT_Project"))
-BRIDGE_SCRIPT = DRIVE_ROOT / "colab/colab_remote_bridge.py"
-assert BRIDGE_SCRIPT.exists(), f"未找到远程接管脚本: {BRIDGE_SCRIPT}"
-sys.argv = [str(BRIDGE_SCRIPT), "--drive-root", str(DRIVE_ROOT)]
-runpy.run_path(str(BRIDGE_SCRIPT), run_name="__main__")
+DRIVE_ROOT = Path(os.environ.get('SIAMDT_DRIVE_ROOT', '/content/drive/MyDrive/SiamDT_Project'))
+RUNTIME_BRIDGE = Path('/content/runtime/SimDT_Pipeline/colab_a100_engineering/colab_remote_bridge.py')  # Cell 2 从 GitHub 拉取的版本
+DRIVE_BRIDGE = DRIVE_ROOT / 'colab/colab_remote_bridge.py'                                            # Drive 副本（回退）
+STATE_DIR = Path('/content/runtime/bridge_state')
+PID_FILE = STATE_DIR / 'bridge.pid'
+LOG_FILE = STATE_DIR / 'bridge_stdout.log'
+LOCAL_STOP = STATE_DIR / 'STOP_BRIDGE'
+DRIVE_STOP = DRIVE_ROOT / 'colab/bridge/STOP_BRIDGE'
+
+
+def _sha256(p):
+    h = hashlib.sha256()
+    with open(p, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+shas = {}
+for tag, p in (('runtime_github', RUNTIME_BRIDGE), ('drive_copy', DRIVE_BRIDGE)):
+    shas[tag] = _sha256(p) if p.exists() else None
+    print(f'[Bridge-SHA256] {tag:15s} {shas[tag] or "(不存在)"}  {p}')
+if shas['runtime_github'] and shas['drive_copy'] and shas['runtime_github'] != shas['drive_copy']:
+    print('[警告] GitHub 运行时版本与 Drive 副本 SHA256 不一致（存在漂移）；本次使用 GitHub 运行时版本。')
+
+BRIDGE = RUNTIME_BRIDGE if RUNTIME_BRIDGE.exists() else DRIVE_BRIDGE
+assert BRIDGE.exists(), f'未找到远程接管脚本: {BRIDGE}'
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+old_txt = PID_FILE.read_text().strip() if PID_FILE.exists() else ''
+old_pid = int(old_txt) if old_txt.isdigit() else None
+if old_pid and _pid_alive(old_pid):
+    print(f'[接管已就绪] 远程接管桥已在后台运行 (PID={old_pid})，无需重复启动。')
+else:
+    for flag in (LOCAL_STOP, DRIVE_STOP):
+        if flag.exists():
+            flag.unlink()
+    log_f = open(LOG_FILE, 'a', encoding='utf-8')
+    proc = subprocess.Popen(
+        [sys.executable, str(BRIDGE), '--drive-root', str(DRIVE_ROOT), '--local-stop-file', str(LOCAL_STOP)],
+        stdout=log_f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+        start_new_session=True, close_fds=True,
+    )
+    PID_FILE.write_text(str(proc.pid))
+    time.sleep(3)
+    if proc.poll() is not None:
+        print(LOG_FILE.read_text(encoding='utf-8', errors='replace')[-3000:])
+        raise RuntimeError(f'远程接管桥启动失败 (returncode={proc.returncode})，日志: {LOG_FILE}')
+    print(f'[接管已就绪] 远程接管桥已在后台运行 (PID={proc.pid}，脚本={BRIDGE})。本单元已返回，可继续运行其它单元。')
+    print(f'             通道: Google Drive 文件队列（cloudflared 隧道默认关闭）；心跳 30 秒；日志: {LOG_FILE}')
+print('[如何停止] 运行下方 Cell 0b（写停止标志，超时后结束进程）；或在本地执行: python local_colab_controller.py --action stop-bridge')
+'''
+
+# ==============================================================================
+# [CELL 0b] 停止远程接管桥（写停止标志；60 秒内未退出则结束进程组）
+# ==============================================================================
+CELL_0B_STOP_BRIDGE = r'''
+import os
+import signal
+import time
+from pathlib import Path
+
+DRIVE_ROOT = Path(os.environ.get('SIAMDT_DRIVE_ROOT', '/content/drive/MyDrive/SiamDT_Project'))
+STATE_DIR = Path('/content/runtime/bridge_state')
+PID_FILE = STATE_DIR / 'bridge.pid'
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+for flag in (STATE_DIR / 'STOP_BRIDGE', DRIVE_ROOT / 'colab/bridge/STOP_BRIDGE'):
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.write_text(time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()) + ' stop requested by Cell 0b\n')
+
+txt = PID_FILE.read_text().strip() if PID_FILE.exists() else ''
+pid = int(txt) if txt.isdigit() else None
+
+
+def _alive(p):
+    try:
+        os.kill(p, 0)
+        return True
+    except OSError:
+        return False
+
+
+if pid is None or not _alive(pid):
+    print('[Cell 0b] 未发现运行中的远程接管桥（已写入停止标志，若桥稍后启动也会立即退出；重新运行 Cell 0 会自动清除标志）。')
+else:
+    for _ in range(60):
+        if not _alive(pid):
+            break
+        time.sleep(1)
+    if _alive(pid):
+        print(f'[Cell 0b] 桥 60 秒内未退出，发送 SIGTERM 到进程组 {pid} ...')
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except Exception as exc:
+            print(f'[Cell 0b] SIGTERM 失败: {exc}')
+        time.sleep(10)
+        if _alive(pid):
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+    print(f'[Cell 0b] 远程接管桥已停止 (PID={pid})。运行中的远程任务（如有）已被终止，结果记为 CANCELLED_BY_BRIDGE_STOP。')
+    PID_FILE.unlink(missing_ok=True)
 '''
 
 # ==============================================================================
@@ -558,8 +663,9 @@ print(json.dumps({
 # ==============================================================================
 # [CELL 4] 双轨运行环境秒级恢复（Tier-1: env_siamdt_cu118 + Tier-2: env_modern_pyt2）
 # ==============================================================================
-CELL_4_BUILD_ENVIRONMENTS = r'''%%bash
-set -euo pipefail
+# 说明（2026-11-04）：原单元使用 IPython 专用的 %%bash 魔法命令，经远程接管桥用普通 Python 进程执行时会报语法错误；
+# 现改为把同一段 bash 脚本交给 subprocess.run(['bash', '-c', ...]) 执行（脚本内容未改动），在 Notebook 与普通 Python 中都可运行。
+CELL_4_BASH_SCRIPT = r'''set -euo pipefail
 
 DRIVE_ROOT="${SIAMDT_DRIVE_ROOT:-/content/drive/MyDrive/SiamDT_Project}"
 SIAMDT_ENV="/content/envs/siamdt-cu118"
@@ -634,6 +740,22 @@ fi
 T_ELAPSED=$(( $(date +%s) - T_START ))
 echo "[完成] 双轨环境 (Tier-1: $SIAMDT_ENV | Tier-2: $MODERN_ENV) 已就绪，耗时 ${T_ELAPSED} 秒。"
 '''
+
+CELL_4_BUILD_ENVIRONMENTS = (
+    "import subprocess\n"
+    "import sys\n"
+    "\n"
+    "# 原 %%bash 单元内容，原样交给 bash 执行（普通 Python 进程与 Notebook 均可运行）\n"
+    "BASH_SCRIPT = r\"\"\"" + CELL_4_BASH_SCRIPT + "\"\"\"\n"
+    "\n"
+    "# 逐行转发输出（Notebook 的 sys.stdout 没有 fileno，不能直接作为子进程 stdout）\n"
+    "proc = subprocess.Popen(['bash', '-c', BASH_SCRIPT], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,\n"
+    "                        text=True, encoding='utf-8', errors='replace', bufsize=1)\n"
+    "for line in proc.stdout:\n"
+    "    print(line, end='', flush=True)\n"
+    "if proc.wait() != 0:\n"
+    "    raise RuntimeError(f'Cell 4 环境恢复脚本失败，returncode={proc.returncode}')\n"
+)
 
 # ==============================================================================
 # [CELL 5] A100 (sm_80) / L4 (sm_89) 算子、245 参数张量 strict=True 加载与 5 帧冒烟测试
@@ -1418,7 +1540,8 @@ else:
 '''
 
 ALL_COLAB_CELLS = [
-    ("CELL 0｜一键开启本地总控 AI 全自动远程接管模式", CELL_0_REMOTE_BRIDGE),
+    ("CELL 0｜后台启动远程接管桥（Drive 文件队列；隧道默认关闭）", CELL_0_REMOTE_BRIDGE),
+    ("CELL 0b｜停止远程接管桥", CELL_0B_STOP_BRIDGE),
     ("CELL 1｜挂载 Google Drive 与建立持久化金库目录树", CELL_1_MOUNT_AND_LAYOUT),
     ("CELL 2｜双源 Git 同步（GitHub 阶段代码库 + 官方 Anti-UAV410 锁定仓库）", CELL_2_DUAL_GIT_SYNC_AND_PATCH),
     ("CELL 3｜数据集与多算法权重完整性核验（SHA-256 校验与软链接）", CELL_3_ASSETS_VERIFY_AND_PREPARE),
@@ -1428,5 +1551,53 @@ ALL_COLAB_CELLS = [
     ("CELL 7｜Phase 6 具备自动断点续训（Auto-Resume）与 Google Drive 实时落盘的训练引擎", CELL_7_AUTO_RESUME_TRAINING_ENGINE),
 ]
 
+CELLS_BY_KEY = {
+    "0": CELL_0_REMOTE_BRIDGE, "0b": CELL_0B_STOP_BRIDGE, "1": CELL_1_MOUNT_AND_LAYOUT,
+    "2": CELL_2_DUAL_GIT_SYNC_AND_PATCH, "3": CELL_3_ASSETS_VERIFY_AND_PREPARE, "4": CELL_4_BUILD_ENVIRONMENTS,
+    "5": CELL_5_MINIMAL_VERIFICATION, "6": CELL_6_UNIFIED_TELEMETRY_EVALUATOR, "7": CELL_7_AUTO_RESUME_TRAINING_ENGINE,
+}
+
+
+def check_cells_plain_python() -> dict:
+    """确认每个单元都是普通 Python：无行首 ! / % 魔法命令，且能被 compile() 编译。"""
+    import re as _re
+    report = {}
+    for key, code in CELLS_BY_KEY.items():
+        magics = [ln for ln in code.splitlines() if _re.match(r"^\s*[!%]", ln)]
+        try:
+            compile(code, f"<colab_cell_{key}>", "exec")
+            compiled = True
+        except SyntaxError as exc:
+            compiled = f"SyntaxError: {exc}"
+        report[key] = {"ipython_magic_lines": magics, "compiles_as_python": compiled}
+    return report
+
+
+def run_cells(keys: str) -> None:
+    """按顺序在独立命名空间中执行指定单元（供远程接管桥 setup_env / stage_assets 动作调用）。"""
+    for key in [k.strip() for k in keys.split(",") if k.strip()]:
+        if key not in CELLS_BY_KEY:
+            raise SystemExit(f"未知单元: {key}；可选 {list(CELLS_BY_KEY)}")
+        if key in ("0", "0b"):
+            raise SystemExit("Cell 0 / 0b 管理远程接管桥本身，不允许经由 --run-cell 执行")
+        print(f"\n===== [colab_init_cells] 执行 CELL {key} =====", flush=True)
+        exec(compile(CELLS_BY_KEY[key], f"<colab_cell_{key}>", "exec"), {"__name__": "__main__"})
+
+
 if __name__ == "__main__":
-    print(f"Colab initialization template module verified successfully ({len(ALL_COLAB_CELLS)} cells ready).")
+    import argparse
+    import json as _json
+
+    _p = argparse.ArgumentParser(description="SimDT Colab 单元模板（可被普通 Python 进程执行）")
+    _p.add_argument("--run-cell", type=str, default="", help="按顺序执行的单元编号，逗号分隔，如 4 或 1,2,3")
+    _p.add_argument("--check-plain-python", action="store_true", help="检查所有单元无 IPython 魔法且可编译")
+    _a = _p.parse_args()
+    if _a.check_plain_python:
+        _rep = check_cells_plain_python()
+        _ok = all(not v["ipython_magic_lines"] and v["compiles_as_python"] is True for v in _rep.values())
+        print(_json.dumps({"plain_python_check": "PASS" if _ok else "FAIL", "cells": _rep}, ensure_ascii=False, indent=2))
+        raise SystemExit(0 if _ok else 1)
+    if _a.run_cell:
+        run_cells(_a.run_cell)
+    else:
+        print(f"Colab initialization template module verified successfully ({len(ALL_COLAB_CELLS)} cells ready).")

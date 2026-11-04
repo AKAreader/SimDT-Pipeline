@@ -1,10 +1,17 @@
 # Phase 2 失败判定标准与三层失败提取协议（Pre-registered & Frozen Protocol）
 
-- **文档版本**：`v1.0-phase2-protocol-frozen`
+- **文档版本**：`v1.1-phase2-protocol-rev20261104`（在 `v1.0-phase2-protocol-frozen` 基础上修订；第一、二章及第三章 3.2 步骤 4 的单算法状态分级阈值**未改动**）
 - **编制单元**：`Subsession-Phase2`（Phase 2 统一评测协议、失败事件提取器与云端资产预置工程师）
-- **生成时间**：`2026-11-04 18:50:00 +08:00`
+- **生成时间**：`2026-11-04 18:50:00 +08:00`；**修订时间**：`2026-11-04`（见下方修订记录）
 - **适用范围**：`Anti-UAV410` 代表性诊断子集（`Core 40`: `24 Discovery + 16 Holdout`）及全量验证集（`Full Val90`: `54 Discovery + 36 Holdout`）上的所有被测跟踪算法（`Original SiamDT Baseline` + Group I 同域训练组 + Group II 零样本/基础模型组）
+- **主口径（2026-11-04 确定）**：Phase 2–5 主口径为 **Core 40（Discovery 24 / Holdout 16）**，Holdout 结果必须封存；Full Val90 保留为扩展验证用。
 - **科研铁律**：本协议在正式跨算法失败统计（Phase 3/4）启动前**预先定义并严格冻结**。对所有被测算法执行 **100% 相同的阈值、桥接规则与窗口对齐准则**，严禁针对单一算法调整失败判定标准。
+
+> [!IMPORTANT]
+> **修订记录 v1.1（2026-11-04，冻结）**
+> - **修订原因**：Claude × Gemini 交叉审查（`review-think-20261104-001`，P0-7）指出 v1.0 的"统一挑战时间窗"由全部参赛算法失败段取并集，(1) 每新增一个算法窗口边界就会漂移；(2) 同域组与零样本组被混在一起计算存活率，零样本算法大面积失败会把"SiamDT 独有短板"（Type C）误判为其他类型，误导创新方向；另外 v1.0 缺少 Holdout 封存的代码护栏。
+> - **修订内容**：① 主口径改为 **Subject-Anchored Windows**（窗口边界仅由 `SiamDT_Baseline` 自身失败 episode 决定），原 Pool-Union 窗口降为补充视图并记录 `tracker_set` 及其 SHA-256；② 存活率按 **同域 / 零样本分轨** 计算，Type A/B/C/D 按分轨规则重写（新增 D0/E/U/X）；③ 新增 **Holdout 封存护栏**（默认拒绝读取，`--unlock-holdout` 解封且输出目录分开）。
+> - **未改动**：逐帧指标、四态分类、τ_fail=0.10、敏感性集合、g_bridge=3、前导 15 帧、恢复判定（K_rec=5, IoU≥0.50）、窗口上下文 [-15, +10]、合并间隔 5 帧、单算法窗口状态分级阈值（SUCCESS / ROBUST_SURVIVAL / TRANSIENT_FAILURE_RECOVERED / FAILED_UNRECOVERED）。
 
 ---
 
@@ -154,13 +161,39 @@ $$\text{PreContext}(E_i) = \big[\max(1, t_{\text{start}} - 15),\; t_{\text{start
 
 ---
 
-## 三、 跨算法统一挑战时间窗协议（Canonical Challenge Windows）
+## 三、 挑战时间窗协议（v1.1：主口径 Subject-Anchored Windows + 补充视图 Pool-Union）
 
-### 3.1 为什么必须构建 Canonical Challenge Windows？
+### 3.0 v1.1 修订：主口径 Subject-Anchored Windows（2026-11-04 冻结）
+1. **窗口边界（主口径）**：对序列 $s$，种子区间**仅**取 `SiamDT_Baseline` 自身的主失败事件段 $\{[t_{\text{start}}^{(k)}, t_{\text{end}}^{(k)}]\}$（$\tau_{\text{fail}}=0.10, g_{\text{bridge}}=3$）；相邻种子间隔 $\le G_{\text{canon}}=5$ 帧合并为核心跨度 $[u_{\text{start}}, u_{\text{end}}]$，再附加 $[\max(1,u_{\text{start}}-15), \min(T_s-1,u_{\text{end}}+10)]$ 上下文。窗口边界**与参与算法集合无关**，后加入的算法不改变已锁定窗口；输出 `window_set_sha256`（窗口 ID 与跨度的哈希）供核验。GT 消失重入区间不作为主口径种子（其仍出现在补充视图中）。
+2. **补充视图 Pool-Union**：保留 v1.0 的 3.2 四步法（全部算法失败段 ∪ GT 消失重入区间），输出文件中写入 `tracker_set`（算法名 + 分组）及 `tracker_set_sha256`，仅作补充分析，不作为 Type 统计主口径。
+3. **单算法状态分级**：沿用 3.2 步骤 4 的 4 级状态与阈值（未改动）。记 *survived* = {`SUCCESS`, `ROBUST_SURVIVAL`}，*failed* = {`FAILED_UNRECOVERED`, `TRANSIENT_FAILURE_RECOVERED`}。
+4. **分轨存活率**：
+   - `in_domain_peer_survival_rate` = 同域组（`group1_in_domain`：FocusTrack、MemLoTrack 各版本等）中 survived 的比例；
+   - `zero_shot_peer_survival_rate` = 零样本组（`group2_zero_shot`：DAM4SAM、SAMOSA、SAMURAI、UETrack、SUTrack、UTPTrack、ReFocus-TIR）中 survived 的比例；
+   - 同时输出两轨的 `failure_rate`、`best_in_domain_peer`、`best_zero_shot_peer` 与 `best_peer`（按窗口平均 SA）；
+   - 分组由提取器内置前缀注册表决定，可用 `--tracker-groups` JSON 覆盖；**未登记的算法记为 `unassigned`，不计入任何一轨**并在输出中列出（例如 AiATrack 需人工确认训练域后再指定分组）。
+5. **Type 判定规则（分轨，阈值冻结）**：*rescuer* = 对手 survived，或（SiamDT 为 `FAILED_UNRECOVERED` 且对手为 `TRANSIENT_FAILURE_RECOVERED`）。
+
+| 类型 | 判定条件（按顺序） |
+| :--- | :--- |
+| `Type_X_Subject_Not_Evaluated` | `SiamDT_Baseline` 在该窗口无逐帧记录 |
+| `Type_U_No_Peer_Evidence` | 两轨均无可用对手记录（不做 A/B/C/D 推断） |
+| `Type_C_SiamDT_Unique_Failure` | SiamDT failed，且同域对手数 $\ge 1$，且 `in_domain_peer_survival_rate` **> 0.5**（同域对手多数存活；零样本轨结果不影响 C 的判定） |
+| `Type_B_Rescued_SiamDT_Failure` | SiamDT failed，非 C，且至少 1 个 rescuer（任一轨；`rescue_tracks` 标注来源轨） |
+| `Type_A_Common_Hard_Failure` | SiamDT failed，且两轨均无 rescuer |
+| `Type_D_InDomain_Peer_Failure_SiamDT_Success` | SiamDT survived，且同域对手数 $\ge 1$，且同域 `failure_rate` **> 0.5** |
+| `Type_D0_ZeroShot_Only_Peer_Failure_SiamDT_Success` | SiamDT survived，非 D，且零样本对手数 $\ge 1$，且零样本 `failure_rate` **> 0.5** |
+| `Type_E_All_Survived` | SiamDT survived，非 D / D0 |
+
+   - 当同域对手仅 1 个时，输出 `type_c_evidence_note = single_in_domain_peer`，论文中需注明证据强度。
+   - 主口径窗口由 SiamDT 自身失败 episode 产生，因此 D/D0/E 主要出现在补充视图中。
+6. **Holdout 封存护栏**：提取器与六层解剖器默认拒绝读取 Holdout 序列（`holdout_verification.json` 的 16 条 ∪ `val90_full.json` 的 `holdout_full_36`）。纯 Holdout 划分直接拒绝；混合划分（如 `val90_full`）自动排除 Holdout 序列且**不打开其遥测文件**，并在输出 `holdout_guard.excluded_holdout_sequences` 中列出；找不到 Holdout 清单时按 fail-closed 拒绝执行。显式 `--unlock-holdout` 后结果写入 `<output_dir>__HOLDOUT_UNSEALED/` 并生成 `HOLDOUT_UNSEAL_RECORD.json`，与 Discovery 结果分开存放。
+
+### 3.1 为什么必须构建统一挑战时间窗？（v1.0 原文，保留）
 在同一条视频序列的同一次物理困难事件（如无人机掠过热辐射高光建筑、进入树冠遮挡或出视野重入）中，不同跟踪器发生抖动或失锁的起止帧往往存在数帧至数十帧的相位差（例如算法 A 在第 `410` 帧失锁，算法 B 在第 `416` 帧失锁并在第 `435` 帧恢复）。
 若直接按各算法自身的 Failure Episode 独立统计，将导致事件分母不一致。通过构建对所有被测算法完全对齐的 **Canonical Challenge Windows（统一挑战时间窗）**，Phase 3 可以在**完全相同的序列区间 $[u_{\text{start}}, u_{\text{end}}]$** 内公平判定每个算法是“稳健存活”、“短暂失锁后恢复”还是“彻底漂移”，从而严密计算 **Failure Matrix** 与 **Rescue Matrix（围点打援救援矩阵）**。
 
-### 3.2 Canonical Challenge Windows 生成算法（四步法）
+### 3.2 Pool-Union 窗口生成算法（四步法；v1.1 起仅作补充视图，步骤 4 的状态分级阈值仍为两种视图共用）
 对于给定子集（如 `discovery_set` 24 序列）中的每一条序列 $s$：
 
 1. **步骤 1｜收集多源种子事件区间（Seed Intervals Collection）**：
@@ -186,7 +219,10 @@ $$\text{PreContext}(E_i) = \big[\max(1, t_{\text{start}} - 15),\; t_{\text{start
    - **`TRANSIENT_FAILURE_RECOVERED`（中途失锁但自救恢复）**：$r_{\text{fail}}^{(m)} > 0.15$，但在窗口结束时已成功恢复锁定（`post_locked == True`）；
    - **`FAILED_UNRECOVERED`（失锁且未恢复）**：$r_{\text{fail}}^{(m)} > 0.15$ 且 `post_locked == False`。
 
-   在此基础上，以 `SiamDT_Baseline` 为锚点，自动将每个 Canonical Challenge Window 归入 Phase 3 的四类诊断象限：
+   > [!WARNING]
+   > **以下 v1.0 Type 判定规则已于 2026-11-04 被 3.0 第 5 条的分轨规则取代**（原因：混合计算同域/零样本存活率会误判 Type C）。保留原文仅供追溯，提取器不再使用。
+
+   在此基础上，以 `SiamDT_Baseline` 为锚点，自动将每个 Canonical Challenge Window 归入 Phase 3 的四类诊断象限（v1.0，已废止）：
    - **`Type_A_Common_Hard_Failure`（共性极限难题）**：`SiamDT_Baseline` 失败（`FAILED_UNRECOVERED` 或 `TRANSIENT_FAILURE_RECOVERED`），且池中**没有任何对比算法**达到 `SUCCESS` 或 `ROBUST_SURVIVAL`；
    - **`Type_B_Rescued_SiamDT_Failure`（可被异构机制救援的失败——“围点打援”核心靶标）**：`SiamDT_Baseline` 失败，而**至少有 1 个对比算法**在该窗口内达到 `SUCCESS` 或 `ROBUST_SURVIVAL`（或当 `SiamDT_Baseline` 为 `FAILED_UNRECOVERED` 时对比算法实现了 `TRANSIENT_FAILURE_RECOVERED` 自救）；
    - **`Type_C_SiamDT_Unique_Failure`（SiamDT 特有结构性失败）**：`Type_B` 的高优先级子集——`SiamDT_Baseline` 失败，而池中**$\ge 80\%$ 的已评测对比算法**均稳健通过（`SUCCESS` / `ROBUST_SURVIVAL`）；
@@ -201,6 +237,9 @@ $$\text{PreContext}(E_i) = \big[\max(1, t_{\text{start}} - 15),\; t_{\text{start
 1. **输入**：
    - 逐帧遥测目录：`<drive_or_local>/experiments/failure_diagnosis/per_frame_telemetry/<TrackerName>_<SplitName>/<seq_id>.jsonl`
    - 冻结划分清单：`Z:\SimDT围点打援\datasets\diagnostic_splits\discovery_set.json`（或 `holdout_verification.json` / `val90_full.json`）
-2. **输出**：
-   - **`FAILURE_EPISODE_DATABASE.json`**：包含所有被测算法在 Level 1（序列级指标与失分拆解）、Level 2（逐帧四态分布、消失重入延迟、$\tau \in \{0.0, 0.10, 0.30, 0.50\}$ 与 $\text{NCE} > 1.0$ 敏感性矩阵）及 Level 3（全部 Failure Episodes 详情、前导 15 帧退化特征与恢复状态）的完整结构化数据库。
-   - **`CANONICAL_CHALLENGE_WINDOWS.json`**：包含跨算法对齐后的统一挑战时间窗列表、每个窗口的物理属性标签、各算法在窗口内的状态分级以及 `Type A / B / C / D` 自动归类与救援算法名单（`rescuing_trackers`）。
+2. **输出**（未解封时写入 `--output-dir`；解封 Holdout 后写入 `<output-dir>__HOLDOUT_UNSEALED/`）：
+   - **`FAILURE_EPISODE_DATABASE.json`**：包含所有被测算法在 Level 1（序列级指标与失分拆解）、Level 2（逐帧四态分布、消失重入延迟、$\tau \in \{0.0, 0.10, 0.30, 0.50\}$ 与 $\text{NCE} > 1.0$ 敏感性矩阵）及 Level 3（全部 Failure Episodes 详情、前导 15 帧退化特征与恢复状态）的完整结构化数据库；v1.1 起附带 `holdout_guard`、`tracker_groups`、`tracker_set_sha256`。
+   - **`CANONICAL_CHALLENGE_WINDOWS.json`**（v1.1 起 = **主口径 Subject-Anchored Windows**，`window_mode = "subject_anchored"`）：窗口列表、物理属性、各算法状态分级、分轨存活率（`in_domain_peer_survival_rate` / `zero_shot_peer_survival_rate`）、`best_peer`、`rescue_tracks`、Type 归类以及 `window_set_sha256`。
+   - **`POOL_UNION_CHALLENGE_WINDOWS.json`**（v1.1 新增，补充视图）：v1.0 并集窗口，附 `tracker_set` 与 `tracker_set_sha256`。
+   - **`HOLDOUT_UNSEAL_RECORD.json`**（仅解封时）：解封时间、涉及序列与"严禁据此回调阈值"的声明。
+3. **自检**：`python failure_episode_extractor.py --self-test` 覆盖桥接/重入延迟、Subject-Anchored 窗口不随新增算法变化、分轨分类、Holdout 默认拒绝 / fail-closed / 解封目录分离。
