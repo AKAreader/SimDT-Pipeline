@@ -48,8 +48,8 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
-BRIDGE_VERSION = "2.0.0"
-DEFAULT_HEARTBEAT_SEC = 30.0
+BRIDGE_VERSION = "2.1.0"
+DEFAULT_HEARTBEAT_SEC = 15.0
 DEFAULT_POLL_SEC = 5.0
 LOG_FSYNC_SEC = 10.0
 MAX_TIMEOUT_SEC = 24 * 3600
@@ -69,6 +69,8 @@ SCRIPT_ACTIONS: Dict[str, Dict[str, Any]] = {
                   "allow_extra_args": False, "python": "system", "default_timeout_min": 60},
     "stage_assets": {"script": "colab_a100_engineering/colab_init_cells.py", "fixed_args": ["--run-cell", "1,2,3"],
                      "allow_extra_args": False, "python": "system", "default_timeout_min": 120},
+    "run_wave1": {"script": "colab_a100_engineering/run_wave1_on_colab.py", "fixed_args": [],
+                  "allow_extra_args": True, "python": "system", "default_timeout_min": 360},
     "run_phase2": {"script": "phase2_unified_eval/run_phase2_multi_tracker_colab.py", "fixed_args": [],
                    "allow_extra_args": True, "python": "system", "default_timeout_min": 720},
     "run_probe": {"script": "phase5_feature_diagnosis/siamdt_6layer_feature_probe.py", "fixed_args": [],
@@ -212,9 +214,37 @@ class ColabRemoteBridge:
         self.processed_cmd_count = 0
         self._parse_failures: Dict[str, int] = {}
         self._queued_notified: set = set()
+        self._last_git_sync_epoch = 0.0
+        self._processed_ids_file = self.bridge_dir / "processed_cmd_ids.json"
+        self._processed_ids: set = self._load_processed_ids()
         self.started_at_epoch = time.time()
         self.started_at_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         self.self_sha256 = sha256_file(Path(__file__).resolve())
+
+    def _load_processed_ids(self) -> set:
+        ids = set()
+        try:
+            if self._processed_ids_file.exists():
+                data = json.loads(self._processed_ids_file.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    ids.update(str(x) for x in data)
+        except Exception:
+            pass
+        try:
+            for p in self.cmd_results_dir.glob("*.result.json"):
+                ids.add(p.name[: -len(".result.json")])
+            for p in self.cmd_processed_dir.glob("*.cmd.json"):
+                ids.add(p.name[: -len(".cmd.json")])
+        except Exception:
+            pass
+        return ids
+
+    def _record_processed_id(self, cmd_id: str) -> None:
+        self._processed_ids.add(cmd_id)
+        try:
+            atomic_fsync_write_json(self._processed_ids_file, sorted(self._processed_ids))  # type: ignore[arg-type]
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ 心跳
     def collect_heartbeat_payload(self, status: str = "ONLINE") -> Dict[str, Any]:
@@ -227,7 +257,15 @@ class ColabRemoteBridge:
         with self._lock:
             active_id, active_action, done = self.active_cmd_id, self.active_action, self.processed_cmd_count
         now = time.time()
-        channels = ["GDRIVE_FILE_QUEUE"] + (["LOCAL_HTTP_SERVER"] if self.http_server else []) + (["CLOUDFLARE_HTTP_TUNNEL"] if self.tunnel_url else [])
+        channels = ["GDRIVE_FILE_QUEUE", "GITHUB_FAST_QUEUE"] + (["LOCAL_HTTP_SERVER"] if self.http_server else []) + (["CLOUDFLARE_HTTP_TUNNEL"] if self.tunnel_url else [])
+        wave_prog = None
+        for wp in (Path("/content/runtime/wave_progress.json"), self.bridge_dir / "wave_progress.json"):
+            if wp.exists():
+                try:
+                    wave_prog = json.loads(wp.read_text(encoding="utf-8"))
+                    break
+                except Exception:
+                    pass
         payload = {
             "status": status,
             "bridge_version": BRIDGE_VERSION,
@@ -252,6 +290,7 @@ class ColabRemoteBridge:
             "active_cmd_id": active_id,
             "active_action": active_action,
             "processed_cmd_count": done,
+            "wave_progress": wave_prog,
             "paths": {"bridge_dir": str(self.bridge_dir), "cmd_queue_dir": str(self.cmd_queue_dir),
                       "cmd_results_dir": str(self.cmd_results_dir), "stop_files": [str(p) for p in self.stop_files]},
         }
@@ -518,15 +557,50 @@ class ColabRemoteBridge:
         return "STARTED", None
 
     # ------------------------------------------------------------------ 队列
+    def _sync_github_queue_dir(self) -> Optional[Path]:
+        repo_dir = Path("/content/runtime/SimDT_Pipeline")
+        if not (repo_dir / ".git").exists():
+            return None
+        now = time.time()
+        if now - self._last_git_sync_epoch >= 10.0:
+            self._last_git_sync_epoch = now
+            try:
+                subprocess.run(["git", "-C", str(repo_dir), "fetch", "origin", "main", "-q"], timeout=15, check=False)
+                subprocess.run(["git", "-C", str(repo_dir), "reset", "--hard", "origin/main", "-q"], timeout=15, check=False)
+            except Exception:
+                pass
+        gh_q = repo_dir / "colab_a100_engineering/bridge_queue"
+        return gh_q if gh_q.exists() else None
+
     def scan_and_process_queue_once(self) -> int:
         refresh_dir(self.cmd_queue_dir)
+        candidates: List[Tuple[Path, bool]] = []
         try:
-            names = [n for n in os.listdir(self.cmd_queue_dir) if n.endswith(".cmd.json")]
+            for n in os.listdir(self.cmd_queue_dir):
+                if n.endswith(".cmd.json"):
+                    candidates.append((self.cmd_queue_dir / n, True))
         except Exception:
-            return 0
-        files = sorted((self.cmd_queue_dir / n for n in names), key=lambda p: (p.stat().st_mtime if p.exists() else 0, p.name))
+            pass
+
+        gh_q = self._sync_github_queue_dir()
+        if gh_q is not None:
+            try:
+                for n in os.listdir(gh_q):
+                    if n.endswith(".cmd.json"):
+                        cid = n[: -len(".cmd.json")]
+                        if cid not in self._processed_ids:
+                            candidates.append((gh_q / n, False))
+            except Exception:
+                pass
+
+        candidates.sort(key=lambda item: (item[0].stat().st_mtime if item[0].exists() else 0, item[0].name))
         handled = 0
-        for cmd_file in files:
+        for cmd_file, is_drive_file in candidates:
+            cid_default = cmd_file.name[: -len(".cmd.json")]
+            if cid_default in self._processed_ids:
+                if is_drive_file:
+                    self._move_processed(cmd_file)
+                continue
             try:
                 spec = json.loads(cmd_file.read_text(encoding="utf-8"))
                 if not isinstance(spec, dict):
@@ -535,18 +609,27 @@ class ColabRemoteBridge:
                 n = self._parse_failures.get(cmd_file.name, 0) + 1
                 self._parse_failures[cmd_file.name] = n
                 if n >= MAX_PARSE_RETRIES:
-                    self._move_processed(cmd_file)
-                    self._reject(cmd_file.name[: -len(".cmd.json")], "", f"队列文件连续 {n} 次解析失败: {exc}")
+                    self._record_processed_id(cid_default)
+                    if is_drive_file:
+                        self._move_processed(cmd_file)
+                    self._reject(cid_default, "", f"队列文件连续 {n} 次解析失败: {exc}")
                 continue
-            spec.setdefault("cmd_id", cmd_file.name[: -len(".cmd.json")])
+            spec.setdefault("cmd_id", cid_default)
+            cid = str(spec["cmd_id"])
+            if cid in self._processed_ids:
+                if is_drive_file:
+                    self._move_processed(cmd_file)
+                continue
             action = str(spec.get("action") or "")
             if action not in BUILTIN_ACTIONS and action and action in ALL_ACTIONS and self.job_running():
                 if cmd_file.name not in self._queued_notified:
-                    _, status_p, _ = self._paths(re.sub(r"[^A-Za-z0-9_.-]", "_", str(spec["cmd_id"])))
-                    atomic_fsync_write_json(status_p, {"cmd_id": spec["cmd_id"], "action": action, "status": "QUEUED_WAITING_FOR_RUNNING_JOB"})
+                    _, status_p, _ = self._paths(re.sub(r"[^A-Za-z0-9_.-]", "_", cid))
+                    atomic_fsync_write_json(status_p, {"cmd_id": cid, "action": action, "status": "QUEUED_WAITING_FOR_RUNNING_JOB"})
                     self._queued_notified.add(cmd_file.name)
                 continue
-            self._move_processed(cmd_file)
+            self._record_processed_id(cid)
+            if is_drive_file:
+                self._move_processed(cmd_file)
             self.dispatch(spec)
             handled += 1
         return handled
