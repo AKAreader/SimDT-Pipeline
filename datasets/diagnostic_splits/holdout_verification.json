@@ -1,0 +1,226 @@
+{
+  "schema_version": "1.0.0",
+  "split_name": "holdout_verification",
+  "split_tier": "core_diagnostic_subset_40",
+  "split_role": "holdout_verification",
+  "benchmark": "Anti-UAV410",
+  "source_partition": "val90",
+  "frozen_at": "2026-11-04T18:20:00+08:00",
+  "design_principles": {
+    "no_tracker_score_cherry_picking": true,
+    "group_disjoint_from_discovery": true,
+    "strict_subset_of_val90_full_holdout": true,
+    "target_ratio": "60:40 (24 Discovery : 16 Holdout)"
+  },
+  "summary": {
+    "num_sequences": 16,
+    "num_recording_groups": 16,
+    "total_frames": 17937,
+    "sa_denominator_frames": 17877,
+    "absent_frames": 715,
+    "attribute_counts": {
+      "TC": 9,
+      "OV": 5,
+      "SV": 5,
+      "FM": 9,
+      "OC": 4,
+      "DBC": 6,
+      "TS": 6,
+      "SS": 14,
+      "MS": 10,
+      "NS": 4
+    },
+    "attribute_rates": {
+      "TC": 0.5625,
+      "OV": 0.3125,
+      "SV": 0.3125,
+      "FM": 0.5625,
+      "OC": 0.2500,
+      "DBC": 0.3750,
+      "TS": 0.3750,
+      "SS": 0.8750,
+      "MS": 0.6250,
+      "NS": 0.2500
+    }
+  },
+  "sequences": [
+    "20190925_140917_1_3",
+    "20190925_143900_1_1",
+    "20190925_183946_1_1",
+    "20190925_200320_1_4",
+    "20190925_213001_1_1",
+    "20190926_141816_1_9",
+    "20190926_142435_1_9",
+    "20190926_144550_1_1",
+    "20190926_183941_1_3",
+    "20190926_195921_1_8",
+    "3700000000002_091732_1",
+    "3700000000002_105009_1",
+    "3700000000002_110352_1",
+    "3700000000002_143252_1",
+    "3700000000002_162623_2",
+    "new30_train-new"
+  ],
+  "sequence_details": [
+    {
+      "seq_name": "20190925_140917_1_3",
+      "recording_group": "20190925_140917_1",
+      "frames": 1000,
+      "sa_denominator": 999,
+      "absent_frames": 0,
+      "attributes": {"TC": 1, "OV": 0, "SV": 1, "FM": 1, "OC": 0, "DBC": 0, "TS": 1, "SS": 1, "MS": 1, "NS": 0},
+      "primary_challenge_tags": ["tiny_target", "thermal_crossover", "scale_variation", "fast_motion"],
+      "label_sha256": "3f031b35941eed6ec32b6ed0987685ba0ff260b60e46fb81e496d6004ff6438d"
+    },
+    {
+      "seq_name": "20190925_143900_1_1",
+      "recording_group": "20190925_143900_1",
+      "frames": 1000,
+      "sa_denominator": 1000,
+      "absent_frames": 0,
+      "attributes": {"TC": 0, "OV": 0, "SV": 0, "FM": 1, "OC": 0, "DBC": 0, "TS": 0, "SS": 1, "MS": 1, "NS": 1},
+      "primary_challenge_tags": ["fast_motion", "multi_scale_transition"],
+      "label_sha256": "b7cd8d447b37c2ae7fdd45292c40cad72852f096e0146a15d6b582b57206f170"
+    },
+    {
+      "seq_name": "20190925_183946_1_1",
+      "recording_group": "20190925_183946_1",
+      "frames": 929,
+      "sa_denominator": 929,
+      "absent_frames": 0,
+      "attributes": {"TC": 0, "OV": 0, "SV": 0, "FM": 1, "OC": 0, "DBC": 0, "TS": 0, "SS": 0, "MS": 1, "NS": 1},
+      "primary_challenge_tags": ["fast_motion", "high_acceleration_maneuver"],
+      "label_sha256": "c96b9d46cddc0851c97ebc87c0e8fe35956e4cc76f80fa312297cf4b57fca018"
+    },
+    {
+      "seq_name": "20190925_200320_1_4",
+      "recording_group": "20190925_200320_1",
+      "frames": 935,
+      "sa_denominator": 935,
+      "absent_frames": 0,
+      "attributes": {"TC": 0, "OV": 0, "SV": 0, "FM": 1, "OC": 0, "DBC": 0, "TS": 0, "SS": 1, "MS": 1, "NS": 0},
+      "primary_challenge_tags": ["fast_motion", "small_target_maneuver"],
+      "label_sha256": "4dbb660597b5dba20848ba49e88559fa73787848405b42da0a923047adc46050"
+    },
+    {
+      "seq_name": "20190925_213001_1_1",
+      "recording_group": "20190925_213001_1",
+      "frames": 794,
+      "sa_denominator": 757,
+      "absent_frames": 0,
+      "attributes": {"TC": 0, "OV": 0, "SV": 1, "FM": 1, "OC": 1, "DBC": 0, "TS": 0, "SS": 1, "MS": 1, "NS": 0},
+      "primary_challenge_tags": ["occlusion", "scale_variation", "fast_motion", "distractor_lock_risk"],
+      "label_sha256": "7d9bce578839d32753bc93a781af2086669d5d3ce6cdc00713d55035b5c6e146"
+    },
+    {
+      "seq_name": "20190926_141816_1_9",
+      "recording_group": "20190926_141816_1",
+      "frames": 1000,
+      "sa_denominator": 1000,
+      "absent_frames": 37,
+      "attributes": {"TC": 1, "OV": 1, "SV": 0, "FM": 0, "OC": 0, "DBC": 0, "TS": 0, "SS": 1, "MS": 1, "NS": 1},
+      "primary_challenge_tags": ["thermal_crossover", "out_of_view_reentry", "post_loss_recovery"],
+      "label_sha256": "82233ec8b5299895f8886a62750fffcedc6b57c506b5b6668d57be633ca1eb5d"
+    },
+    {
+      "seq_name": "20190926_142435_1_9",
+      "recording_group": "20190926_142435_1",
+      "frames": 299,
+      "sa_denominator": 299,
+      "absent_frames": 0,
+      "attributes": {"TC": 1, "OV": 0, "SV": 0, "FM": 0, "OC": 0, "DBC": 0, "TS": 0, "SS": 0, "MS": 1, "NS": 1},
+      "primary_challenge_tags": ["thermal_crossover", "short_sequence_stability"],
+      "label_sha256": "8d8b7911373fda9aafa578ee8a4d3a8090e8e26ae1d3c02e7926c4fbdc599bb0"
+    },
+    {
+      "seq_name": "20190926_144550_1_1",
+      "recording_group": "20190926_144550_1",
+      "frames": 1000,
+      "sa_denominator": 1000,
+      "absent_frames": 0,
+      "attributes": {"TC": 1, "OV": 0, "SV": 0, "FM": 0, "OC": 0, "DBC": 0, "TS": 0, "SS": 1, "MS": 1, "NS": 0},
+      "primary_challenge_tags": ["thermal_crossover", "gradual_drift_risk"],
+      "label_sha256": "f28549bd5e154f7959ba8f1f80d3ca33f4a9ec54d67b97302e6786cca1bf7119"
+    },
+    {
+      "seq_name": "20190926_183941_1_3",
+      "recording_group": "20190926_183941_1",
+      "frames": 1000,
+      "sa_denominator": 977,
+      "absent_frames": 70,
+      "attributes": {"TC": 0, "OV": 0, "SV": 1, "FM": 1, "OC": 1, "DBC": 0, "TS": 0, "SS": 1, "MS": 1, "NS": 0},
+      "primary_challenge_tags": ["occlusion", "scale_variation", "fast_motion", "post_loss_recovery"],
+      "label_sha256": "1580a7276d1e5485cbd71b7f649192a56c14902c42cfa1a55638af52fa0150c4"
+    },
+    {
+      "seq_name": "20190926_195921_1_8",
+      "recording_group": "20190926_195921_1",
+      "frames": 1000,
+      "sa_denominator": 1000,
+      "absent_frames": 0,
+      "attributes": {"TC": 1, "OV": 0, "SV": 1, "FM": 0, "OC": 0, "DBC": 0, "TS": 0, "SS": 1, "MS": 1, "NS": 0},
+      "primary_challenge_tags": ["thermal_crossover", "scale_variation"],
+      "label_sha256": "32940a642661f33e404d124eea4a69ecb73569e2cfc52f7cef3975aaf69ee68a"
+    },
+    {
+      "seq_name": "3700000000002_091732_1",
+      "recording_group": "3700000000002_091732",
+      "frames": 1480,
+      "sa_denominator": 1480,
+      "absent_frames": 0,
+      "attributes": {"TC": 0, "OV": 1, "SV": 0, "FM": 0, "OC": 0, "DBC": 1, "TS": 1, "SS": 1, "MS": 0, "NS": 0},
+      "primary_challenge_tags": ["tiny_target", "out_of_view_boundary", "dynamic_background_clutter", "pseudo_target_distractor"],
+      "label_sha256": "488a65197083ae7be2afea93baaac12c3d4db6d06f473872eb9aacc1ebbd1604"
+    },
+    {
+      "seq_name": "3700000000002_105009_1",
+      "recording_group": "3700000000002_105009",
+      "frames": 1500,
+      "sa_denominator": 1500,
+      "absent_frames": 385,
+      "attributes": {"TC": 1, "OV": 1, "SV": 0, "FM": 1, "OC": 0, "DBC": 1, "TS": 1, "SS": 1, "MS": 0, "NS": 0},
+      "primary_challenge_tags": ["tiny_target", "thermal_crossover", "long_out_of_view_reentry", "fast_motion", "dynamic_background_clutter", "post_loss_recovery"],
+      "label_sha256": "b433b232e644dc845dc8736a4dc46464f05e8d8cb765b4e9d569bf965c23a4c3"
+    },
+    {
+      "seq_name": "3700000000002_110352_1",
+      "recording_group": "3700000000002_110352",
+      "frames": 1500,
+      "sa_denominator": 1500,
+      "absent_frames": 0,
+      "attributes": {"TC": 1, "OV": 0, "SV": 0, "FM": 0, "OC": 0, "DBC": 1, "TS": 1, "SS": 1, "MS": 0, "NS": 0},
+      "primary_challenge_tags": ["tiny_target", "thermal_crossover", "dynamic_background_clutter", "gradual_drift_risk"],
+      "label_sha256": "6f13d91b8935f626b70e89583b72edee4a6f8bf4b2e485b078f9acd7355f490d"
+    },
+    {
+      "seq_name": "3700000000002_143252_1",
+      "recording_group": "3700000000002_143252",
+      "frames": 1500,
+      "sa_denominator": 1500,
+      "absent_frames": 0,
+      "attributes": {"TC": 1, "OV": 0, "SV": 0, "FM": 1, "OC": 1, "DBC": 1, "TS": 0, "SS": 1, "MS": 0, "NS": 0},
+      "primary_challenge_tags": ["thermal_crossover", "fast_motion", "occlusion", "dynamic_background_clutter", "distractor_lock_risk"],
+      "label_sha256": "26caecbc64977b703fa955feb96fbf10f589bf4ca8423c5c0c0a0063ac0a27cc"
+    },
+    {
+      "seq_name": "3700000000002_162623_2",
+      "recording_group": "3700000000002_162623",
+      "frames": 1500,
+      "sa_denominator": 1500,
+      "absent_frames": 60,
+      "attributes": {"TC": 1, "OV": 1, "SV": 1, "FM": 1, "OC": 1, "DBC": 1, "TS": 1, "SS": 1, "MS": 1, "NS": 0},
+      "primary_challenge_tags": ["9_attributes_composite", "tiny_target", "occlusion", "out_of_view_reentry", "scale_variation", "dynamic_background_clutter"],
+      "label_sha256": "3b74b185e2c27b878be5199f70bffcd634f075788cd7fb708261cebe8b3fab1c"
+    },
+    {
+      "seq_name": "new30_train-new",
+      "recording_group": "new30_train-new",
+      "frames": 1500,
+      "sa_denominator": 1500,
+      "absent_frames": 163,
+      "attributes": {"TC": 0, "OV": 1, "SV": 0, "FM": 0, "OC": 0, "DBC": 1, "TS": 1, "SS": 1, "MS": 0, "NS": 0},
+      "primary_challenge_tags": ["tiny_target", "out_of_view_reentry", "dynamic_background_clutter", "post_loss_recovery"],
+      "label_sha256": "dcd8efe75ddf380e58e3521dae57c707626508e4b79a31d9cdf8e232e749bbed"
+    }
+  ]
+}

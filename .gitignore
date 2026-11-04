@@ -1,0 +1,66 @@
+# ==============================================================================
+# SimDT 围点打援｜GitHub 阶段代码仓库 .gitignore 规范
+# 原则：GitHub 只存轻量级阶段代码、配置契约、冻结子集索引(JSON)、Colab Notebook 与诊断报告；
+#       大体积数据集、模型权重(.pth/.pt/.tar/.safetensors)、训练日志与 Wheel 缓存一律归入 Google Drive！
+# ==============================================================================
+
+# 1. 模型权重与大型归档包（严格交由 Google Drive 托管）
+*.pth
+*.pt
+*.tar
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+*.engine
+*.zip
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+
+# 2. 原始视频帧与大型数据集文件（仅允许提交 datasets/diagnostic_splits/*.json 索引契约）
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.mp4
+*.avi
+datasets/AntiUAV410/
+datasets/archives/
+weights/
+environments/wheels/
+
+# 3. 大体积训练运行目录与临时缓存（仅保留轻量汇总报告与必要 JSON 清单）
+experiments/runs_training/
+*.tfrecord
+events.out.tfevents.*
+
+# 4. Python / IDE / OS 临时文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store

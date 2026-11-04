@@ -1,0 +1,230 @@
+{
+  "schema": "siamdt-phase0-method-pool-census-v1",
+  "created_at": "2026-11-04T16:58:00+08:00",
+  "subject_baseline": {
+    "method": "Original SiamDT Baseline (SiamDTRCNN)",
+    "year": 2023,
+    "venue": "IEEE TPAMI / Anti-UAV410 Official Baseline",
+    "paradigm": "Full-Image Two-Stage Detector-Based Siamese Tracker (Swin-Tiny + 5-level FPN + DS-RPN + VR-CNN + 11-Proposal Linear Background Subtraction + Single-State EMA Template Update)",
+    "code_path": "D:\\CodexProjects\\SiamDT_Project\\code\\Anti-UAV410\\trackers\\SiamDT\\trackers\\siamdt_rcnn.py",
+    "config_path": "D:\\CodexProjects\\SiamDT_Project\\code\\Anti-UAV410\\trackers\\SiamDT\\configs\\siamdt_swin_tiny_sgd.py",
+    "structural_characteristics_and_weakness_hypotheses": [
+      {
+        "axis": "A1_Search_Scope_and_Resolution",
+        "fact": "Searches the entire image every frame via RPN (1000 proposals -> Top-5 truncation) on FPN strides [4, 8, 16, 32, 64] with 7x7 RoIAlign.",
+        "weakness_hypothesis": "Lacks local high-resolution focusing for tiny targets (<16px) and is vulnerable to full-image far-away thermal distractors."
+      },
+      {
+        "axis": "A2_Temporal_Memory_and_Update_Gate",
+        "fact": "Maintains only a single running-average template _bbox_feats_z (lr=0.01), gated solely by current-frame tra_bboxes[0]+det_bboxes[0]>1.9 and IoU>0.8 before background re-ranking.",
+        "weakness_hypothesis": "Lacks multi-frame memory bank, motion-consistency gating, and rollback capability when template or background state degrades."
+      },
+      {
+        "axis": "A3_Background_Distractor_Suppression",
+        "fact": "Samples 11 RPN proposals with IoU<=0 from the query/update frame into _bbox_feats_bg, subtracts max matching score from Top-5, and overwrites all 11 background features on every update.",
+        "weakness_hypothesis": "Does not persistently anchor hard local confusers/distractors and fails when uncertain/occluded frames trigger updates."
+      },
+      {
+        "axis": "A4_Motion_Modeling_and_Recovery",
+        "fact": "Zero explicit motion model (no Kalman filter, no nonlinear trajectory predictor, no optical-flow GMC, no drift-detection/recovery state machine).",
+        "weakness_hypothesis": "Once hijacked by a background thermal hotspot or after fast nonlinear UAV maneuvers, suffers long-horizon irreversible drift (e.g., 101+ frame zero-overlap episodes account for 60.1% of zero-IoU loss on val90)."
+      },
+      {
+        "axis": "A5_Target_Absence_and_Feature_Interaction",
+        "fact": "Always outputs a dense 4D box (never predicts target absence) and relies on discrete 7x7 RoI cross-correlation rather than continuous video-level hidden states.",
+        "weakness_hypothesis": "Loses all 2088 absent frames on val90 (1.76pp macro SA loss) and degrades under continuous low-contrast/occlusion sequences."
+      }
+    ]
+  },
+  "core_experimental_pool_batch1_recommended": [
+    {
+      "id": "CORE-01",
+      "method": "FocusTrack",
+      "year": 2025,
+      "venue": "arXiv:2504.13604 (2025)",
+      "technical_route": "One-Stream ViT (DropMAE) + Self-Adaptive Local Sampling (Confidence-Driven Dynamic Search Factor Scaling)",
+      "main_differences_from_siamdt": "Replaces SiamDT's fixed full-image RPN search with a local search crop whose Search Factor (SF) dynamically expands when tracking confidence drops and contracts to focus on tiny targets when stable.",
+      "open_source_status": "Verified HTTP 200 (https://github.com/vero1925/FocusTrack); complete source tree (lib, tracking, experiments, annos).",
+      "weights_status": "Verified Available (Google Drive & Baidu Netdisk pwd: 1106); includes FocusTrack single/stage2 weights AND Anti-UAV410-retrained weights for OSTrack, ROMTrack, ZoomTrack, DropTrack.",
+      "fair_reproduction_and_alignment": "Yes (Group I: In-Domain Anti-UAV410 Trained). Uses identical Anti-UAV410 splits and can output per-frame bbox + confidence score.",
+      "complementary_diagnostic_axis": "A1_Search_Scope_and_Resolution (Local Dynamic Search Factor vs. Full-Image Fixed RPN)",
+      "why_core_pool": "Directly tests whether SiamDT's failures on tiny targets and far-field thermal clutter are rescued by self-adaptive local sampling, while providing 4 bonus retrained local-tracker baselines in the same codebase."
+    },
+    {
+      "id": "CORE-02",
+      "method": "MemLoTrack",
+      "year": 2025,
+      "venue": "MDPI Sensors (2025.11, DOI: 10.3390/s25237359)",
+      "technical_route": "Frozen DINOv2 ViT + LoRA PEFT + Gated FIFO Memory Bank + Kalman Motion-Consistency Update Gate + Motion-Aware Memory Attention Layer (MAL)",
+      "main_differences_from_siamdt": "Replaces SiamDT's Swin-T/FPN + single EMA template with a frozen foundation backbone (DINOv2+LoRA) and a multi-frame FIFO memory bank protected by both classification confidence and Kalman-filter motion consistency checks.",
+      "open_source_status": "Verified HTTP 200 (https://github.com/SeoulTech-HCIRLab/MemLoTrack); complete trackit codebase with dedicated Anti-UAV410 config.",
+      "weights_status": "Verified Available (Google Drive); provides both antiuav410_retrained_weight.bin (SOT pretrained + Anti-UAV410 fine-tuned) and antiuav410_scratch_weight.bin (Anti-UAV410 only).",
+      "fair_reproduction_and_alignment": "Yes (Group I: In-Domain Anti-UAV410 Trained, with both scratch and retrained checkpoints for controlled comparison).",
+      "complementary_diagnostic_axis": "A2_Temporal_Memory_and_Update_Gate (Kalman-Gated Multi-Frame Memory Attention vs. Ungated Single-State EMA)",
+      "why_core_pool": "Directly tests whether motion-consistency-gated FIFO memory + MAL rescues SiamDT's template degradation and drift episodes, while allowing strict separation of backbone pretraining (retrained vs. scratch)."
+    },
+    {
+      "id": "CORE-03",
+      "method": "DAM4SAM (SAM 2.1++)",
+      "year": "2025–2026",
+      "venue": "CVPR 2025 / IJCV 2026 (arXiv:2411.17576)",
+      "technical_route": "SAM 2.1 Foundation Tracker + Distractor-Aware Memory (Decoupled Recent Appearance Memory RAM & Distractor-Resolving Memory DRM) + Introspective Mask-Uncertainty Update Freezing",
+      "main_differences_from_siamdt": "Replaces SiamDT's 11 random non-target RPN proposals (_bbox_feats_bg overwritten on every update) with an explicit Distractor-Resolving Memory (DRM) that anchors hard confusers and freezes memory updates whenever output mask geometry/area exhibits multi-peak uncertainty.",
+      "open_source_status": "Verified HTTP 200 (https://github.com/jovanavidenovic/DAM4SAM); complete source with run_on_box_dataset.py for bounding-box benchmarks.",
+      "weights_status": "Verified Available (Official SAM 2.1 checkpoints via download script; training-free memory mechanism).",
+      "fair_reproduction_and_alignment": "Yes (Group II: Zero-Shot Box-Initialized Foundation Model). Evaluates on identical frames with first-frame GT box initialization.",
+      "complementary_diagnostic_axis": "A3_Background_Distractor_Suppression (Persistent Distractor-Resolving Memory + Uncertainty Freeze vs. 11-Proposal Linear Subtraction)",
+      "why_core_pool": "Serves as the sharpest mechanism probe for diagnosing why SiamDT's background suppression fails under thermal crossovers, similar-looking background hotspots, and partial occlusion."
+    },
+    {
+      "id": "CORE-04",
+      "method": "SAMOSA (with SAMURAI baseline)",
+      "year": 2026,
+      "venue": "arXiv:2605.22538 (2026.05, Tsinghua; paired with SAMURAI 2025)",
+      "technical_route": "SAM 2.1 + Higher-Order Markov Nonlinear Motion Predictor (MP) + Error Detection–Recovery Module (EDRM) + Target-Aware Memory Bank (TAMB)",
+      "main_differences_from_siamdt": "Adds explicit nonlinear trajectory dynamics (MP) and an explicit Error Detection–Recovery state machine (EDRM) that detects semantic/geometric shifts and triggers recovery, whereas SiamDT has zero motion model and suffers permanent drift once locked onto clutter.",
+      "open_source_status": "Verified HTTP 200 (https://github.com/DurYi/SAMOSA and https://github.com/yangchris11/samurai); complete source code.",
+      "weights_status": "Verified Available (Motion Predictor checkpoint sam2/checkpoints/mp.pth is committed directly inside the GitHub repo + official SAM 2.1 checkpoints).",
+      "fair_reproduction_and_alignment": "Yes (Group II: Visual Zero-Shot + BBox-Trajectory-Trained Motion Prior). Specifically validated on Anti-UAV nonlinear motion scenarios.",
+      "complementary_diagnostic_axis": "A4_Motion_Modeling_and_Recovery (Nonlinear Motion Predictor + Error Recovery vs. Memoryless Full-Image RPN)",
+      "why_core_pool": "Directly targets SiamDT's #1 failure budget item on val90 (the 101+ frame long-horizon zero-IoU drift episodes caused by fast maneuvers, camera shake, and failed re-acquisition)."
+    },
+    {
+      "id": "CORE-05",
+      "method": "UETrack / MCITrack",
+      "year": "2025–2026",
+      "venue": "CVPR 2026 (UETrack, arXiv:2603.01412) & AAAI 2025 (MCITrack, arXiv:2412.11023)",
+      "technical_route": "MCITrack: Mamba Hidden-State Video-Level Contextual Propagation; UETrack: Unified 5-Modality (incl. Thermal) Token-Pooling Mixture-of-Experts (TP-MoE) + Target-Aware Adaptive Distillation",
+      "main_differences_from_siamdt": "MCITrack propagates continuous video-level context through Mamba hidden states across backbone layers rather than discrete 7x7 RoI correlation; UETrack routes thermal/degraded tokens dynamically via similarity-driven Mixture-of-Experts.",
+      "open_source_status": "Verified HTTP 200 (https://github.com/kangben258/UETrack and https://github.com/kangben258/MCITrack); complete PyTracking/OSTrack-style codebase.",
+      "weights_status": "Verified Available (HuggingFace kangben258/UETrack and Google Drive for MCITrack).",
+      "fair_reproduction_and_alignment": "Yes (Group II: Cross-Domain SOT / Thermal-Unified Pretrained; also supports fine-tuning if required later).",
+      "complementary_diagnostic_axis": "A5_Continuous_Context_and_Thermal_Representation (Mamba Hidden-State Context & MoE Routing vs. Discrete RoI Correlation)",
+      "why_core_pool": "Tests whether continuous state-space context propagation (MCITrack) and adaptive expert routing (UETrack) rescue SiamDT during gradual thermal contrast decay and scale changes."
+    }
+  ],
+  "core_experimental_pool_batch2_reserve": [
+    {
+      "id": "RES-01",
+      "method": "AsymTrack",
+      "year": 2025,
+      "venue": "AAAI 2025 (arXiv:2503.00516)",
+      "technical_route": "Asymmetric Two-Stream Siamese Network + Efficient Template Modulation (ETM) + Object Perception Enhancement (OPE)",
+      "open_source_status": "Verified HTTP 200 (https://github.com/jiawen-zhu/AsymTrack)",
+      "weights_status": "Verified Available (Google Drive & Baidu Netdisk pwd: asym)",
+      "why_reserve": "Closest 2025 structural relative to SiamDT's two-stream modulation paradigm ('Two-Stream Beats One-Stream'); ideal reserve baseline if two-stream vs. one-stream attribution needs isolation."
+    },
+    {
+      "id": "RES-02",
+      "method": "UTPTrack",
+      "year": 2026,
+      "venue": "CVPR 2026 (arXiv:2602.23734)",
+      "technical_route": "Unified Token Pruning across Search Region, Dynamic Template, and Static Template (>65% background token removal)",
+      "open_source_status": "Verified HTTP 200 (https://github.com/EIT-NLP/UTPTrack)",
+      "weights_status": "Verified Available (HuggingFace HarrisonWu/UTPTrack)",
+      "why_reserve": "Tests whether early-stage token pruning of background clutter outperforms SiamDT's late-stage R-CNN Top-5 background subtraction."
+    },
+    {
+      "id": "RES-03",
+      "method": "ORTrack / SGLATrack",
+      "year": 2025,
+      "venue": "CVPR 2025 (arXiv:2504.09228 & arXiv:2503.06625)",
+      "technical_route": "Occlusion-Robust ViT with Random Masking Distillation (ORTrack) & Similarity-Guided Layer-Adaptive ViT (SGLATrack) for Real-Time UAV Tracking",
+      "open_source_status": "Verified HTTP 200 (https://github.com/wuyou3474/ORTrack and https://github.com/GXNU-ZhongLab/SGLATrack)",
+      "weights_status": "Verified Available (Google Drive & Baidu Netdisk pwd: cvpr)",
+      "why_reserve": "Specialized UAV trackers for occlusion robustness and layer-adaptive inference."
+    },
+    {
+      "id": "RES-04",
+      "method": "MPT (Motion-Prompt-Tracking)",
+      "year": 2025,
+      "venue": "ICML 2025 (arXiv:2505.16321)",
+      "technical_route": "Plug-and-Play Long-Term Trajectory Motion Prompt Encoder + Adaptive Visual-Motion Fusion Decoder",
+      "open_source_status": "Verified HTTP 200 (https://github.com/zj5559/Motion-Prompt-Tracking)",
+      "weights_status": "Verified Available (Baidu Netdisk pwd: 8j2g)",
+      "why_reserve": "Clean plug-and-play coordinate trajectory prompt module integrated into OSTrack/SeqTrack/ARTrack."
+    }
+  ],
+  "reference_pool": [
+    {
+      "id": "REF-01",
+      "method": "TAPTrack",
+      "year": 2026,
+      "venue": "IEEE TGRS (2026.04, DOI: 10.1109/TGRS.2026.3682081)",
+      "technical_route": "Expanded Search Factor Local Transformer + Temporal Prompt Decoder (TPD) + Dual Tracking Heads with Peak-to-Sidelobe Ratio (PSR) State Discrimination",
+      "open_source_status": "Placeholder Repo Only (https://github.com/cui344119693/TAPTrack has only LICENSE and README.md; code marked 'Coming Soon').",
+      "weights_status": "No model weights released; only raw .txt prediction boxes on Anti-UAV410 test set (Baidu Netdisk pwd: ghxs).",
+      "reason_for_reference_pool": "Cannot run live inference, cannot evaluate on val90 diagnostic subset, and cannot extract internal confidence/response maps. Mechanism (TPD + PSR state discrimination) and test-set .txt trajectories are retained for reference only."
+    },
+    {
+      "id": "REF-02",
+      "method": "MCATrack",
+      "year": 2025,
+      "venue": "ICCV 2025",
+      "technical_route": "Magnocellular-Inspired Multi-Frame Motion Response Module (enhancing tiny drone SNR against static clutter) + Dynamic Cross-Guided Module",
+      "open_source_status": "Verified HTTP 404 (https://github.com/zhangjiahao02/MCATrack does not exist).",
+      "weights_status": "None.",
+      "reason_for_reference_pool": "No public code or weights. Paper-reported Anti-UAV410 numbers (SA 69.18%) must NOT be mixed with our unified experiments; only its bio-inspired multi-frame motion contrast mechanism is studied."
+    },
+    {
+      "id": "REF-03",
+      "method": "DTPTrack",
+      "year": 2026,
+      "venue": "CVPR 2026 (arXiv:2604.02654)",
+      "technical_route": "Drift-Resilient Temporal Priors for Visual Tracking",
+      "open_source_status": "Verified HTTP 200 Full Code (https://github.com/NorahGreen/DTPTrack).",
+      "weights_status": "No pretrained weights or GitHub releases uploaded yet as of 2026-11-04.",
+      "reason_for_reference_pool": "Code is open-source (trackit framework), but pretrained weights are not yet released; kept in Reference Pool until weights drop or if we decide to train it from scratch."
+    },
+    {
+      "id": "REF-04",
+      "method": "Dist-Tracker",
+      "year": 2025,
+      "venue": "CVPRW 2025 (4th Anti-UAV Challenge Track 3 Winner)",
+      "technical_route": "YOLOv12 with Scale/Shape/BoxQuality-Aware (SSQ) Small-Target Enhancement + L2-IoU Hybrid Metric SORT + Sparse Optical-Flow Global Motion Compensation (GMC)",
+      "open_source_status": "Verified HTTP 200 Full Code (https://github.com/earth-insights/Dist-Tracker).",
+      "weights_status": "No direct Anti-UAV410 SOT checkpoint bundled in README (designed for Track 3 Multi-UAV MOTA evaluation).",
+      "reason_for_reference_pool": "Different task protocol (multi-UAV detection-by-tracking without first-frame target-specific template matching), but its Sparse Optical-Flow GMC and L2-IoU hybrid metric for tiny 640x512 thermal targets are highly valuable mechanism references."
+    },
+    {
+      "id": "REF-05",
+      "method": "CMRTrack",
+      "year": 2026,
+      "venue": "arXiv:2607.23209 (2026.07 Preprint)",
+      "technical_route": "Counterfactual Motion Reliability Learning for Robust UAV Tracking",
+      "open_source_status": "No public repository.",
+      "weights_status": "None.",
+      "reason_for_reference_pool": "Unpublished preprint without code/weights; valuable mechanism concept (counterfactual reliability weighting between motion prior and visual appearance)."
+    },
+    {
+      "id": "REF-06",
+      "method": "DLST",
+      "year": 2025,
+      "venue": "CVPRW 2025 Anti-UAV Workshop",
+      "technical_route": "Dual-Template Co-Evolution Learning for Robust Long-Term Drone Tracking",
+      "open_source_status": "No public repository.",
+      "weights_status": "None.",
+      "reason_for_reference_pool": "No code or weights; mechanism reference for static/dynamic dual-template co-evolution."
+    },
+    {
+      "id": "REF-07",
+      "method": "FSTC-DiMP",
+      "year": 2025,
+      "venue": "MDPI Remote Sensing (2025.08, DOI: 10.3390/rs17162902)",
+      "technical_route": "Frequency-Spatial-Temporal Context + Large Selective Kernel (LSK) in Discriminative Model Prediction (DiMP)",
+      "open_source_status": "No public repository (base DiMP/SuperDiMP/KeepTrack available locally in Anti-UAV410 pytracking).",
+      "weights_status": "None.",
+      "reason_for_reference_pool": "No code/weights and ambiguous training/ablation text in paper; kept strictly as mechanism reference."
+    },
+    {
+      "id": "REF-08",
+      "method": "SiamDiff / Enhanced-SiamDT / SAM-STIR / UAUTrack / SATATrack / LoRATv2 / TGTrack",
+      "year": "2025–2026",
+      "venue": "Remote Sensing 2026 / Electronics 2026 / IEEE TGRS 2026 / arXiv 2025 / NeurIPS 2025 / CVPR 2026",
+      "technical_route": "Various (Frame-Difference / Attention Cascade on SiamDT / SAM Thermal Adaptation / Multimodal Text-Prompt / Causal KV-Cache LoRA / Temporal Generative Decoder)",
+      "open_source_status": "Unopened, HTTP 404 (SATATrack), or README-only placeholder repos (LoRATv2, TGTrack).",
+      "weights_status": "None.",
+      "reason_for_reference_pool": "Lack runnable code and weights. Enhanced-SiamDT is additionally documented as a negative warning example of Module Shopping (stacking ECA+LSK+WDAM with only +0.12 SA from template/background tweaks)."
+    }
+  ]
+}

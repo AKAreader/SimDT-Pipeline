@@ -1,0 +1,75 @@
+{
+  "project_name": "SiamDT Failure-driven Algorithm Innovation Pipeline (围点打援)",
+  "workspace_root": "Z:\\SimDT围点打援",
+  "physical_drive_root": "G:\\我的云端硬盘\\SimDT围点打援",
+  "github_repository": "https://github.com/AKAreader/SimDT-Pipeline",
+  "github_clone_url": "https://github.com/AKAreader/SimDT-Pipeline.git",
+  "colab_drive_root": "/content/drive/MyDrive/SiamDT_Project",
+  "master_control_role": "Chief Engineer (项目总工 / 总控会话)",
+  "compute_allocation_policy": {
+    "colab_a100_sm80": "70%-80% (Main heavy training, ablations, full multi-tracker benchmark)",
+    "colab_l4_sm89": "10%-15% (Auxiliary smoke tests, single-subset probes, Phase 5 feature extraction)",
+    "local_vscode_control": "10%-15% (Master orchestration, Phase 1/3/4 lightweight JSON/CSV statistics, code authoring & GitHub stage push)"
+  },
+  "current_subject": "Original SiamDT Baseline (SiamDTRCNN, Swin-Tiny + 5-level FPN, 245 parameter tensors)",
+  "excluded_methods": [
+    "SiamISDT / auto_SCLT_menchan-new-cuda2 (Senior brother's method - strictly excluded per user directive)"
+  ],
+  "current_phase": "Phase 2 (Unified Evaluation & Failure Episode Database)",
+  "current_gate": "Gate 2 (Pending Phase 2 Execution on Colab A100/L4)",
+  "gate_status": "GATE_1_APPROVED_ENTERING_PHASE_2",
+  "last_updated": "2026-11-04T18:40:30+08:00",
+  "phases": {
+    "Phase 0": {
+      "name": "2025-2026 相关方法普查与实验池设计",
+      "status": "APPROVED_AT_GATE_0",
+      "git_tag": "v0.1-phase0-pool-locked",
+      "approved_at": "2026-11-04T17:38:27+08:00"
+    },
+    "Phase 1": {
+      "name": "Anti-UAV 代表性诊断子集建立 (24 Discovery : 16 Holdout, 嵌套于 54:36 Full Val90)",
+      "status": "APPROVED_AND_FROZEN_AT_GATE_1",
+      "git_tag": "v1.0-phase1-subset-frozen",
+      "approved_at": "2026-11-04T18:38:15+08:00",
+      "deliverables": [
+        "phase1_diagnostic_subset/PHASE1_SUBSET_DESIGN_REPORT.md",
+        "phase1_diagnostic_subset/DIAGNOSTIC_SUBSET_MANIFEST.json",
+        "phase1_diagnostic_subset/build_diagnostic_subset.py",
+        "datasets/diagnostic_splits/val90_full.json",
+        "datasets/diagnostic_splits/discovery_set.json",
+        "datasets/diagnostic_splits/holdout_verification.json"
+      ]
+    },
+    "Engineering_Infrastructure": {
+      "name": "VS Code + GitHub + Colab (A100/L4) + Google Drive 四位一体工程套件",
+      "status": "ACTIVE_AND_BOUND_TO_GITHUB",
+      "github_repo": "https://github.com/AKAreader/SimDT-Pipeline",
+      "deliverables": [
+        "colab_a100_engineering/ARCHITECTURE_GITHUB_COLAB_GDRIVE.md",
+        "colab_a100_engineering/SimDT_Colab_A100_Master.ipynb",
+        "colab_a100_engineering/colab_init_cells.py",
+        "colab_a100_engineering/git_stage_sync.ps1"
+      ]
+    },
+    "Phase 2": {
+      "name": "统一评测与失败事件数据库 (Canonical Challenge Windows)",
+      "status": "IN_PROGRESS"
+    },
+    "Phase 3": {
+      "name": "跨算法失败模式与互补性分析 (Failure Matrix & Rescue Matrix)",
+      "status": "LOCKED_UNTIL_GATE_2"
+    },
+    "Phase 4": {
+      "name": "失败因素数学统计 (Failure Risk Profile)",
+      "status": "LOCKED_UNTIL_GATE_3"
+    },
+    "Phase 5": {
+      "name": "重点失败事件的内部特征诊断",
+      "status": "LOCKED_UNTIL_GATE_4"
+    },
+    "Phase 6": {
+      "name": "Failure-Mechanism-Module 创新候选与最小干预验证",
+      "status": "LOCKED_UNTIL_GATE_5"
+    }
+  }
+}
