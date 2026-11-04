@@ -19,11 +19,19 @@ Phase 2 Colab 多算法统一评测与权重拉取调度器 (run_phase2_multi_tr
      10. ReFocus-TIR (TNNLS 热红外参数高效注意力重聚焦)
 
 核心特性：
-1. 权重与源码持久化金库：自动将源码拉取至 Google Drive `repos/core_pool/`，权重拉取至 `weights/`，
+1. A100 算力吃满混合并发调度 (`--concurrency-mode hybrid_b_then_a`, `--gpu-slots`):
+   - **方案 B 优先（多算法同卡并发）**：当待评测算法数 M >= GPU 算力槽位数 S 时，优先并发启动 S 个不同算法进程；
+   - **方案 A 自动补位（单算法内多视频分片并发）**：
+     a) 当 1 <= M < S（如只跑单个算法或最后剩余少数算法）时，自动将每个待跑算法的未完成序列拆分为 K = floor(S / M)
+        （含余数分配使总分片数等于 S）个并行视频分片 (`pending_seqs[shard_idx::num_shards]`) 同时运行，吃满 100% 算力槽位；
+     b) 在方案 B 多算法并发运行过程中，进程池实时扫描 `telemetry_eval_dir/*.jsonl`：一旦某个快算法先跑完腾出空闲槽位，
+        而某个慢算法仍有 > 4 条未完成序列，立即在空闲槽位上为该慢算法动态派生补充的方案 A 分片 Worker（从末尾反向抢占未完成序列，
+        配合 `.jsonl` 与 `.lock` 原子级双重检查防重跑），直至全部序列完成并统一汇总生成 `eval_progress_summary.json`！
+2. 权重与源码持久化金库：自动将源码拉取至 Google Drive `repos/core_pool/`，权重拉取至 `weights/`，
    并在运行期同步至 Colab 本地高速盘 `/content/runtime/`；
-2. 逐序列断点续评 (Auto-Resume)：每跑完 1 条序列立即将 `.txt` 预测框、官方兼容 JSON 与统一 `.jsonl`
+3. 逐序列断点续评 (Auto-Resume)：每跑完 1 条序列立即将 `.txt` 预测框、官方兼容 JSON 与统一 `.jsonl`
    逐帧遥测实时 fsync 刷入 Google Drive，断线重连自动跳过已完成序列；
-3. 统一遥测转换与三层失败提取：内置原生日式推理适配器与通用预测框摄入器 (`--ingest-raw-txt-dir`)，
+4. 统一遥测转换与三层失败提取：内置原生推理适配器与通用预测框摄入器 (`--ingest-raw-txt-dir`)，
    评测完成后可一键调用 `failure_episode_extractor.py` 生成 `FAILURE_EPISODE_DATABASE.json`
    与 `CANONICAL_CHALLENGE_WINDOWS.json`。
 """
@@ -52,6 +60,18 @@ from failure_episode_extractor import (  # noqa: E402
     calc_iou_xywh,
     run_phase2_extraction_pipeline,
 )
+
+
+# ==============================================================================
+# 并发调度常量
+# ==============================================================================
+CONCURRENCY_MODES = (
+    "serial",
+    "plan_b_multi_tracker",
+    "plan_a_seq_shards",
+    "hybrid_b_then_a",
+)
+DYNAMIC_BACKFILL_MIN_REMAINING_SEQS = 4  # 慢算法未完成序列数 > 4 时触发动态方案 A 补位 Worker
 
 
 # ==============================================================================
@@ -271,18 +291,20 @@ TRACKER_REGISTRY: Dict[str, Dict[str, Any]] = {
 
 
 # ==============================================================================
-# 通用工具函数
+# 通用工具与硬件槽位自动探测函数
 # ==============================================================================
 def resolve_default_drive_root() -> Path:
-    """自动识别 Colab `/content/drive/MyDrive/SiamDT_Project` 或本地 `G:\\我的云端硬盘\\SiamDT_Project`。"""
+    """自动识别 Colab `/content/drive/MyDrive/SiamDT_Project` 或本地 `Z:/SiamDT_Project` / `G:/我的云端硬盘/SiamDT_Project`。"""
     env_val = os.environ.get("SIAMDT_DRIVE_ROOT")
     if env_val:
         return Path(env_val)
     colab_path = Path("/content/drive/MyDrive/SiamDT_Project")
     if colab_path.exists() or Path("/content/drive").exists():
         return colab_path
-    win_gdrive = Path("G:/我的云端硬盘/SiamDT_Project")
-    return win_gdrive
+    z_drive = Path("Z:/SiamDT_Project")
+    if z_drive.exists():
+        return z_drive
+    return Path("G:/我的云端硬盘/SiamDT_Project")
 
 
 def fsync_write_text(path: Path, content: str) -> None:
@@ -318,7 +340,6 @@ def parse_tracker_selection(selection: str) -> List[str]:
         return [k for k, v in TRACKER_REGISTRY.items() if v["group"] == "group2_zero_shot"]
 
     resolved: List[str] = []
-    # 支持大小写不敏感匹配
     lower_map = {k.lower(): k for k in TRACKER_REGISTRY.keys()}
     for part in sel.split(","):
         p = part.strip()
@@ -341,6 +362,62 @@ def load_split_sequences(split_path: Path) -> Tuple[List[str], Dict[str, Any]]:
     if isinstance(raw, dict) and "sequences" in raw and isinstance(raw["sequences"], list):
         return [str(x) for x in raw["sequences"]], raw
     raise ValueError(f"无效的子集 JSON 结构: {split_path}")
+
+
+def detect_optimal_gpu_slots(requested_slots: int = 0) -> Dict[str, Any]:
+    """
+    根据 GPU 显存与型号自动计算并发算力槽位数 S (`--gpu-slots`):
+      - A100 80GB (VRAM >= 70GB) -> 6 槽位
+      - A100 40GB (VRAM >= 35GB) -> 4 槽位
+      - L4 24GB   (VRAM >= 20GB) -> 2 槽位
+      - 其他 GPU / CPU            -> 1 槽位
+    若用户显式传入 requested_slots > 0，则以用户指定值为准。
+    """
+    gpu_name = "NO_GPU_DETECTED"
+    vram_mb = 0.0
+    auto_slots = 1
+    tier_label = "FALLBACK_1_SLOT"
+
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).strip()
+        if out:
+            first_line = out.splitlines()[0]
+            parts = [x.strip() for x in first_line.split(",")]
+            gpu_name = parts[0]
+            vram_mb = float(parts[1]) if len(parts) > 1 else 0.0
+    except Exception:
+        pass
+
+    vram_gb = round(vram_mb / 1024.0, 2) if vram_mb > 0 else 0.0
+    name_upper = gpu_name.upper()
+
+    if vram_gb >= 70.0 or ("A100" in name_upper and "80GB" in name_upper):
+        auto_slots = 6
+        tier_label = "A100_80GB_6_SLOTS"
+    elif vram_gb >= 35.0 or "A100" in name_upper:
+        auto_slots = 4
+        tier_label = "A100_40GB_4_SLOTS"
+    elif vram_gb >= 20.0 or "L4" in name_upper:
+        auto_slots = 2
+        tier_label = "L4_24GB_2_SLOTS"
+    else:
+        auto_slots = 1
+        tier_label = f"GENERIC_1_SLOT ({gpu_name})"
+
+    effective_slots = requested_slots if requested_slots > 0 else auto_slots
+    return {
+        "detected_gpu_name": gpu_name,
+        "detected_vram_gb": vram_gb,
+        "hardware_tier_label": tier_label,
+        "auto_recommended_slots": auto_slots,
+        "requested_slots_arg": requested_slots,
+        "effective_gpu_slots": effective_slots,
+    }
 
 
 # ==============================================================================
@@ -529,6 +606,7 @@ def stage_repos_and_weights(
                         output=str(weight_drive),
                         quiet=False,
                         use_cookies=False,
+                        remaining_ok=True,
                     )
                     downloaded = [p.name for p in weight_drive.rglob("*") if p.is_file()]
                     tk_res["weight_status"].append(f"GDRIVE_FOLDER_PULLED: {downloaded}")
@@ -565,7 +643,6 @@ def stage_repos_and_weights(
                         tk_res["weight_status"].append(f"DOWNLOADED: {fname} ({dst_p.stat().st_size} bytes)")
 
             elif wtype == "repo_builtin_plus_sam2":
-                # 1. 复制仓库内置的 mp.pth (非线性运动预测器权重)
                 builtin_mp = repo_drive / wsrc["repo_builtin_rel"]
                 dst_mp = weight_drive / "mp.pth"
                 if builtin_mp.exists() and not dst_mp.exists():
@@ -573,7 +650,6 @@ def stage_repos_and_weights(
                     tk_res["weight_status"].append(f"COPIED_REPO_BUILTIN: {dst_mp.name}")
                 elif dst_mp.exists():
                     tk_res["weight_status"].append(f"READY: {dst_mp.name}")
-                # 2. 确保 SAM 2.1 基座权重就绪
                 sam2_dst = drive_root / wsrc["sam2_checkpoint"]
                 sam2_dst.parent.mkdir(parents=True, exist_ok=True)
                 if not (sam2_dst.exists() and sam2_dst.stat().st_size > 10_000_000):
@@ -636,7 +712,6 @@ def ingest_raw_predictions_to_telemetry(
         gt_rects = lbl["gt_rect"]
         exist_flags = lbl.get("exist", [1] * len(gt_rects))
 
-        # 查找预测框文件 (<seq_id>.txt 或 <seq_id>.json)
         cand_files = [
             raw_pred_dir / f"{seq_id}.txt",
             raw_pred_dir / f"{seq_id}.json",
@@ -667,7 +742,6 @@ def ingest_raw_predictions_to_telemetry(
             missing_preds.append(f"{seq_id} (empty predictions)")
             continue
 
-        # 读取可选置信度与耗时文件 (如 <seq_id>_score.txt / <seq_id>_time.txt)
         conf_file = raw_pred_dir / f"{seq_id}_score.txt"
         confs: Optional[List[float]] = None
         if conf_file.exists():
@@ -715,41 +789,334 @@ def ingest_raw_predictions_to_telemetry(
 
 
 # ==============================================================================
-# 功能 4: Colab A100/L4 统一序列推理与遥测落盘调度器 (--action eval)
+# 功能 4: 混合并发调度器 (方案 B 多算法并发优先 + 方案 A 单算法多视频分片自动补位)
 # ==============================================================================
+def get_tracker_eval_dirs(
+    drive_root: Path,
+    tracker_name: str,
+    split_stem: str,
+    git_short_sha: str,
+) -> Dict[str, Path]:
+    """获取某算法在 Google Drive 上的标准评测与遥测输出目录字典。"""
+    spec = TRACKER_REGISTRY[tracker_name]
+    eval_root = drive_root / "experiments/benchmark_eval" / spec["group"] / f"{tracker_name}_{split_stem}_{git_short_sha}"
+    return {
+        "eval_root": eval_root,
+        "txt_box_dir": eval_root / "pred_bboxes_txt",
+        "uavtir_json_dir": eval_root / "pred_bboxes_uavtir_json",
+        "telemetry_eval_dir": eval_root / "per_frame_telemetry",
+        "telemetry_diag_dir": drive_root / "experiments/failure_diagnosis/per_frame_telemetry" / f"{tracker_name}_{split_stem}",
+    }
+
+
+def scan_realtime_pending_sequences(
+    drive_root: Path,
+    dataset_val_dir: Path,
+    tracker_name: str,
+    split_stem: str,
+    target_sequences: List[str],
+    git_short_sha: str = "phase2",
+    expected_frames_map: Optional[Dict[str, int]] = None,
+) -> Tuple[List[str], List[str], List[str]]:
+    """
+    实时扫描 `telemetry_eval_dir/*.jsonl` 与 `telemetry_diag_dir/*.jsonl` 及 `.lock` 文件，
+    返回 `(completed_seqs, unfinished_seqs, unclaimed_unfinished_seqs)`。
+    """
+    dirs = get_tracker_eval_dirs(drive_root, tracker_name, split_stem, git_short_sha)
+    tel_eval_dir = dirs["telemetry_eval_dir"]
+    tel_diag_dir = dirs["telemetry_diag_dir"]
+
+    completed: List[str] = []
+    unfinished: List[str] = []
+    unclaimed_unfinished: List[str] = []
+    now_ts = time.time()
+
+    for seq_id in target_sequences:
+        exp_len = expected_frames_map.get(seq_id, 0) if expected_frames_map else 0
+        if exp_len <= 0:
+            lbl_p = dataset_val_dir / seq_id / "IR_label.json"
+            if lbl_p.exists():
+                try:
+                    exp_len = len(json.loads(lbl_p.read_text(encoding="utf-8")).get("gt_rect", []))
+                except Exception:
+                    exp_len = 0
+
+        # 检查是否已完成落盘
+        is_done = False
+        for check_dir in (tel_eval_dir, tel_diag_dir):
+            jf = check_dir / f"{seq_id}.jsonl"
+            if jf.exists() and jf.stat().st_size > 0:
+                try:
+                    line_cnt = sum(1 for ln in jf.open("r", encoding="utf-8") if ln.strip())
+                    if (exp_len > 0 and line_cnt == exp_len) or (exp_len == 0 and line_cnt > 0):
+                        is_done = True
+                        break
+                except Exception:
+                    pass
+
+        if is_done:
+            completed.append(seq_id)
+            continue
+
+        unfinished.append(seq_id)
+
+        # 检查是否有其他活跃分片 Worker 正在锁定推理该序列 (.{seq_id}.lock 且未超时 30 分钟)
+        lock_eval = tel_eval_dir / f".{seq_id}.lock"
+        lock_diag = tel_diag_dir / f".{seq_id}.lock"
+        is_claimed = False
+        for lf in (lock_eval, lock_diag):
+            if lf.exists():
+                try:
+                    if (now_ts - lf.stat().st_mtime) < 1800.0:
+                        is_claimed = True
+                        break
+                except OSError:
+                    pass
+        if not is_claimed:
+            unclaimed_unfinished.append(seq_id)
+
+    return completed, unfinished, unclaimed_unfinished
+
+
+def finalize_tracker_eval_summary(
+    drive_root: Path,
+    tracker_name: str,
+    split_stem: str,
+    target_sequences: List[str],
+    git_short_sha: str = "phase2",
+) -> Dict[str, Any]:
+    """
+    当某算法的所有分片 Worker 完成后，统一扫描全部 `{seq_id}.jsonl` 汇总生成无冲突的 `eval_progress_summary.json`。
+    """
+    spec = TRACKER_REGISTRY[tracker_name]
+    dirs = get_tracker_eval_dirs(drive_root, tracker_name, split_stem, git_short_sha)
+    tel_eval_dir = dirs["telemetry_eval_dir"]
+    tel_diag_dir = dirs["telemetry_diag_dir"]
+    eval_root = dirs["eval_root"]
+
+    seq_sa_scores: Dict[str, float] = {}
+    for seq_id in target_sequences:
+        jf = tel_eval_dir / f"{seq_id}.jsonl"
+        if not jf.exists():
+            jf = tel_diag_dir / f"{seq_id}.jsonl"
+        if jf.exists() and jf.stat().st_size > 0:
+            try:
+                rows = [json.loads(ln) for ln in jf.read_text(encoding="utf-8").splitlines() if ln.strip()]
+                if rows:
+                    seq_sa_scores[seq_id] = round(float(sum(r["sa_score"] for r in rows) / len(rows)), 6)
+            except Exception:
+                pass
+
+    mean_sa = round(sum(seq_sa_scores.values()) / len(seq_sa_scores), 6) if seq_sa_scores else 0.0
+    summary_payload = {
+        "tracker_name": tracker_name,
+        "tracker_group": spec["group"],
+        "split_name": split_stem,
+        "stage_git_sha": git_short_sha,
+        "completed_sequences_count": len(seq_sa_scores),
+        "total_target_sequences": len(target_sequences),
+        "mean_sa_score": mean_sa,
+        "per_sequence_sa": seq_sa_scores,
+        "updated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    if eval_root.exists():
+        fsync_write_text(eval_root / "eval_progress_summary.json", json.dumps(summary_payload, indent=2, ensure_ascii=False))
+    return summary_payload
+
+
+def build_hybrid_schedule_plan(
+    tracker_pending_map: Dict[str, List[str]],
+    gpu_slots: int,
+    concurrency_mode: str,
+) -> Dict[str, Any]:
+    """
+    根据待跑算法集合 `tracker_pending_map` (算法名 -> 待测序列列表)、总算力槽位数 `gpu_slots` (S)
+    与并发模式 `concurrency_mode` 生成初始并发波次计划与动态补位策略表：
+      - 若 M >= S 且为 `hybrid_b_then_a` / `plan_b_multi_tracker`：
+        首批启动 S 个不同算法进程（每个算法 1 个主 Worker，占满 S 个槽位），其余 M - S 个算法进入等待队列；
+      - 若 1 <= M < S 且为 `hybrid_b_then_a`：
+        自动触发【方案 A 视频分片补位】，为每个算法分配 K_i = floor(S / M) (+ 余数分配) 个并行分片 Worker，
+        使首批并发启动的总进程数直接等于 S，100% 吃满 A100 算力槽位！
+    """
+    S = max(1, int(gpu_slots))
+    active_trackers = [tk for tk, pseqs in tracker_pending_map.items() if len(pseqs) > 0]
+    M = len(active_trackers)
+
+    initial_wave_jobs: List[Dict[str, Any]] = []
+    queued_trackers: List[str] = []
+    strategy_summary = ""
+
+    if M == 0:
+        strategy_summary = "ALL_TRACKERS_ALREADY_COMPLETED"
+    elif concurrency_mode == "serial":
+        strategy_summary = f"SERIAL_MODE (1 slot active at a time across {M} trackers)"
+        first_tk = active_trackers[0]
+        initial_wave_jobs.append({
+            "slot_id": 0,
+            "tracker_name": first_tk,
+            "shard_idx": 0,
+            "num_shards": 1,
+            "dynamic_helper": False,
+            "assigned_sequences_preview": tracker_pending_map[first_tk][:4],
+            "assigned_sequences_count": len(tracker_pending_map[first_tk]),
+        })
+        queued_trackers = active_trackers[1:]
+
+    elif concurrency_mode == "plan_b_multi_tracker":
+        launch_tks = active_trackers[:S]
+        queued_trackers = active_trackers[S:]
+        strategy_summary = (
+            f"PLAN_B_MULTI_TRACKER_ONLY (Launching {len(launch_tks)}/{M} trackers across {S} GPU slots, 1 shard/tracker)"
+        )
+        for slot_idx, tk in enumerate(launch_tks):
+            pseqs = tracker_pending_map[tk]
+            initial_wave_jobs.append({
+                "slot_id": slot_idx,
+                "tracker_name": tk,
+                "shard_idx": 0,
+                "num_shards": 1,
+                "dynamic_helper": False,
+                "assigned_sequences_preview": pseqs[:4],
+                "assigned_sequences_count": len(pseqs),
+            })
+
+    elif concurrency_mode == "plan_a_seq_shards":
+        first_tk = active_trackers[0]
+        queued_trackers = active_trackers[1:]
+        pseqs = tracker_pending_map[first_tk]
+        k_shards = min(S, len(pseqs))
+        strategy_summary = (
+            f"PLAN_A_SEQ_SHARDS_ONLY (Tracker {first_tk} split into {k_shards} parallel video shards across {S} GPU slots)"
+        )
+        for s_idx in range(k_shards):
+            shard_seqs = pseqs[s_idx::k_shards]
+            initial_wave_jobs.append({
+                "slot_id": s_idx,
+                "tracker_name": first_tk,
+                "shard_idx": s_idx,
+                "num_shards": k_shards,
+                "dynamic_helper": False,
+                "assigned_sequences_preview": shard_seqs[:4],
+                "assigned_sequences_count": len(shard_seqs),
+            })
+
+    elif concurrency_mode == "hybrid_b_then_a":
+        if M >= S:
+            launch_tks = active_trackers[:S]
+            queued_trackers = active_trackers[S:]
+            strategy_summary = (
+                f"HYBRID_STAGE1_PLAN_B_PRIORITY (M={M} >= S={S}: Launching {S} distinct trackers in parallel to fill all {S} slots; "
+                f"{len(queued_trackers)} trackers queued; dynamic Plan-A shard helpers auto-spawn when free slots appear & remaining_seqs > {DYNAMIC_BACKFILL_MIN_REMAINING_SEQS})"
+            )
+            for slot_idx, tk in enumerate(launch_tks):
+                pseqs = tracker_pending_map[tk]
+                initial_wave_jobs.append({
+                    "slot_id": slot_idx,
+                    "tracker_name": tk,
+                    "shard_idx": 0,
+                    "num_shards": 1,
+                    "dynamic_helper": False,
+                    "assigned_sequences_preview": pseqs[:4],
+                    "assigned_sequences_count": len(pseqs),
+                })
+        else:
+            # 1 <= M < S: 自动触发方案 A 视频分片补位，将 S 个槽位按 floor(S / M) + 余数分配给 M 个待跑算法
+            base_k = S // M
+            rem = S % M
+            # 按待跑序列数降序排列以优先获得余数分片槽位
+            sorted_tks = sorted(active_trackers, key=lambda x: len(tracker_pending_map[x]), reverse=True)
+            shards_per_tk: Dict[str, int] = {}
+            for i, tk in enumerate(sorted_tks):
+                alloc = base_k + (1 if i < rem else 0)
+                shards_per_tk[tk] = max(1, min(alloc, len(tracker_pending_map[tk])))
+
+            strategy_summary = (
+                f"HYBRID_PLAN_B_PLUS_PLAN_A_SHARD_BACKFILL (1 <= M={M} < S={S}: Auto-splitting {M} trackers into "
+                f"{sum(shards_per_tk.values())} parallel video shards {shards_per_tk} to fill 100% of {S} GPU slots)"
+            )
+            slot_cursor = 0
+            for tk in active_trackers:
+                k_shards = shards_per_tk[tk]
+                pseqs = tracker_pending_map[tk]
+                for s_idx in range(k_shards):
+                    shard_seqs = pseqs[s_idx::k_shards]
+                    initial_wave_jobs.append({
+                        "slot_id": slot_cursor,
+                        "tracker_name": tk,
+                        "shard_idx": s_idx,
+                        "num_shards": k_shards,
+                        "dynamic_helper": False,
+                        "assigned_sequences_preview": shard_seqs[:4],
+                        "assigned_sequences_count": len(shard_seqs),
+                    })
+                    slot_cursor += 1
+    else:
+        raise ValueError(f"未知的 concurrency_mode: {concurrency_mode}")
+
+    return {
+        "concurrency_mode": concurrency_mode,
+        "total_gpu_slots": S,
+        "active_trackers_count_M": M,
+        "strategy_decision": strategy_summary,
+        "initial_wave_slots_occupied": len(initial_wave_jobs),
+        "slot_utilization_rate_wave1": round(len(initial_wave_jobs) / S, 4) if S > 0 else 0.0,
+        "initial_wave_jobs": initial_wave_jobs,
+        "queued_trackers_after_wave1": queued_trackers,
+        "dynamic_plan_a_backfill_policy": {
+            "enabled": (concurrency_mode == "hybrid_b_then_a"),
+            "min_unfinished_sequences_to_trigger_helper": DYNAMIC_BACKFILL_MIN_REMAINING_SEQS + 1,
+            "condition_rule": f"remaining_unfinished_seqs > {DYNAMIC_BACKFILL_MIN_REMAINING_SEQS}",
+            "realtime_monitor_source": "telemetry_eval_dir/*.jsonl + .{seq_id}.lock",
+            "helper_steal_direction": "tail_reverse_order (pending_seqs[::-1] with atomic .lock & .jsonl double-check)",
+        },
+    }
+
+
 def _build_worker_script_for_tracker(tracker_name: str, spec: Dict[str, Any]) -> str:
     """
-    为指定跟踪器生成在对应虚拟环境 (Tier-1 或 Tier-2) 中运行的单序列/批序列统一推理 Python 脚本。
-    所有适配器严格遵循：
-    - 仅在 frame_id == 0 读取 gt_rect[0] 初始化；
-    - 逐帧输出 pred_bbox [x, y, w, h]、confidence、template_updated、latency_ms；
-    - 每完成 1 条序列立即 fsync 写入 Google Drive，支持断点续评。
+    为指定跟踪器生成在对应虚拟环境 (Tier-1 或 Tier-2) 中运行的并发分片 Worker 脚本。
+    支持：
+    - 接收环境变量 `_P2_SHARD_IDX` (0..K-1)、`_P2_NUM_SHARDS` (K) 与 `_P2_DYNAMIC_HELPER` ("0" 或 "1")；
+    - 对 `pending_seqs[shard_idx::num_shards]` 进行无冲突分片推理；
+    - 若为动态派生的方案 A 补位 Worker (`_P2_DYNAMIC_HELPER="1"`)，从序列列表末尾反向抢占未完成序列；
+    - 启动每一条序列前均再次检查 `{seq_id}.jsonl` 与 `.{seq_id}.lock` 原子锁，彻底杜绝多 Worker 重复跑同一序列！
     """
     return r'''
 import os, sys, json, math, time
 import numpy as np
 from pathlib import Path
 
-DRIVE_ROOT = Path(os.environ[" _P2_DRIVE_ROOT ".strip()])
-RUNTIME_ROOT = Path(os.environ[" _P2_RUNTIME_ROOT ".strip()])
-TRACKER_NAME = os.environ[" _P2_TRACKER_NAME ".strip()]
-TRACKER_GROUP = os.environ[" _P2_TRACKER_GROUP ".strip()]
-ADAPTER_TYPE = os.environ[" _P2_ADAPTER_TYPE ".strip()]
-REPO_DIR = Path(os.environ[" _P2_REPO_DIR ".strip()])
-WEIGHT_DIR = Path(os.environ[" _P2_WEIGHT_DIR ".strip()])
-PRIMARY_WEIGHT = os.environ[" _P2_PRIMARY_WEIGHT ".strip()]
-DEFAULT_CFG = os.environ[" _P2_DEFAULT_CFG ".strip()]
-TRACKER_MOD = os.environ.get(" _P2_TRACKER_MOD ".strip(), "")
-SPLIT_JSON = Path(os.environ[" _P2_SPLIT_JSON ".strip()])
-DATASET_DIR = Path(os.environ[" _P2_DATASET_DIR ".strip()])
-GIT_SHA = os.environ.get(" _P2_GIT_SHA ".strip(), "phase2")
-MAX_SEQS = int(os.environ.get(" _P2_MAX_SEQS ".strip(), "0"))
+DRIVE_ROOT = Path(os.environ["_P2_DRIVE_ROOT"])
+RUNTIME_ROOT = Path(os.environ["_P2_RUNTIME_ROOT"])
+TRACKER_NAME = os.environ["_P2_TRACKER_NAME"]
+TRACKER_GROUP = os.environ["_P2_TRACKER_GROUP"]
+ADAPTER_TYPE = os.environ["_P2_ADAPTER_TYPE"]
+REPO_DIR = Path(os.environ["_P2_REPO_DIR"])
+WEIGHT_DIR = Path(os.environ["_P2_WEIGHT_DIR"])
+PRIMARY_WEIGHT = os.environ["_P2_PRIMARY_WEIGHT"]
+DEFAULT_CFG = os.environ["_P2_DEFAULT_CFG"]
+TRACKER_MOD = os.environ.get("_P2_TRACKER_MOD", "")
+SPLIT_JSON = Path(os.environ["_P2_SPLIT_JSON"])
+DATASET_DIR = Path(os.environ["_P2_DATASET_DIR"])
+GIT_SHA = os.environ.get("_P2_GIT_SHA", "phase2")
+MAX_SEQS = int(os.environ.get("_P2_MAX_SEQS", "0"))
+
+SHARD_IDX = int(os.environ.get("_P2_SHARD_IDX", "0"))
+NUM_SHARDS = max(1, int(os.environ.get("_P2_NUM_SHARDS", "1")))
+IS_DYNAMIC_HELPER = os.environ.get("_P2_DYNAMIC_HELPER", "0") == "1"
+WORKER_TAG = os.environ.get("_P2_WORKER_TAG", f"shard{SHARD_IDX}of{NUM_SHARDS}")
 
 raw_split = json.loads(SPLIT_JSON.read_text(encoding="utf-8"))
 split_stem = raw_split.get("split_name", SPLIT_JSON.stem)
 seq_list = [str(x) for x in raw_split["sequences"]]
 if MAX_SEQS > 0:
     seq_list = seq_list[:MAX_SEQS]
+
+expected_len_map = {
+    item["seq_name"]: int(item.get("frames", 0))
+    for item in raw_split.get("sequence_details", [])
+    if "seq_name" in item
+}
 
 eval_root = DRIVE_ROOT / "experiments/benchmark_eval" / TRACKER_GROUP / f"{TRACKER_NAME}_{split_stem}_{GIT_SHA}"
 txt_box_dir = eval_root / "pred_bboxes_txt"
@@ -780,32 +1147,88 @@ def calc_iou_xywh(pred, gt):
     union = (pw * ph) + (gw * gh) - inter
     return float(inter / union) if union > 0 else 0.0
 
-# 1. 扫描已完成序列（支持断线重连无缝跳过）
-completed_seqs = []
-pending_seqs = []
-seq_sa_scores = {}
+def is_seq_already_done(seq_id: str) -> bool:
+    exp_len = expected_len_map.get(seq_id, 0)
+    if exp_len <= 0:
+        lbl_file = DATASET_DIR / seq_id / "IR_label.json"
+        if lbl_file.exists():
+            try:
+                exp_len = len(json.loads(lbl_file.read_text(encoding="utf-8"))["gt_rect"])
+            except Exception:
+                exp_len = 0
+    for cdir in (telemetry_eval_dir, telemetry_diag_dir):
+        jf = cdir / f"{seq_id}.jsonl"
+        if jf.exists() and jf.stat().st_size > 0:
+            try:
+                cnt = sum(1 for ln in jf.open("r", encoding="utf-8") if ln.strip())
+                if (exp_len > 0 and cnt == exp_len) or (exp_len == 0 and cnt > 0):
+                    return True
+            except Exception:
+                pass
+    return False
 
-for seq_id in seq_list:
-    lbl_file = DATASET_DIR / seq_id / "IR_label.json"
-    jsonl_file = telemetry_diag_dir / f"{seq_id}.jsonl"
-    txt_file = txt_box_dir / f"{seq_id}.txt"
-    if lbl_file.exists() and jsonl_file.exists() and txt_file.exists():
+def try_acquire_seq_lock(seq_id: str) -> bool:
+    """在启动序列推理前尝试获取 .{seq_id}.lock，防止多个分片或动态补位 Worker 重复跑同一条序列。"""
+    if is_seq_already_done(seq_id):
+        return False
+    lock_file = telemetry_eval_dir / f".{seq_id}.lock"
+    now_ts = time.time()
+    if lock_file.exists():
         try:
-            gt_len = len(json.loads(lbl_file.read_text(encoding="utf-8"))["gt_rect"])
-            rows = [json.loads(ln) for ln in jsonl_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
-            if gt_len > 0 and len(rows) == gt_len:
-                completed_seqs.append(seq_id)
-                seq_sa_scores[seq_id] = float(np.mean([r["sa_score"] for r in rows]))
-                continue
-        except Exception:
-            pass
-    pending_seqs.append(seq_id)
+            if (now_ts - lock_file.stat().st_mtime) < 1800.0:
+                return False
+            lock_file.unlink()
+        except OSError:
+            return False
+    payload = json.dumps({"pid": os.getpid(), "worker_tag": WORKER_TAG, "claimed_at": now_ts})
+    try:
+        fd = os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w", encoding="utf-8") as lf:
+            lf.write(payload)
+            lf.flush()
+        return True
+    except FileExistsError:
+        return False
+    except OSError:
+        # 若底层 FUSE 不支持 O_EXCL，退化为读写校验
+        try:
+            lock_file.write_text(payload, encoding="utf-8")
+            return True
+        except OSError:
+            return False
 
-print(f"[{TRACKER_NAME} | {split_stem}] 已完成序列: {len(completed_seqs)}/{len(seq_list)} | 待评测序列: {len(pending_seqs)}")
+def release_seq_lock(seq_id: str):
+    lock_file = telemetry_eval_dir / f".{seq_id}.lock"
+    try:
+        if lock_file.exists():
+            lock_file.unlink()
+    except OSError:
+        pass
+
+# 1. 扫描当前尚未完成的序列池，并按分片模式确定本 Worker 的执行队列
+pending_seqs = [s for s in seq_list if not is_seq_already_done(s)]
 if not pending_seqs:
+    print(f"[{TRACKER_NAME} | {WORKER_TAG}] 所有目标序列均已完成，直接退出。")
     sys.exit(0)
 
-# 2. 构建统一单帧步进跟踪器接口 (init(img_path, gt_xywh) -> step(img_path) -> (pred_xywh, conf, up_flag))
+if IS_DYNAMIC_HELPER:
+    # 动态派生的方案 A 补位 Worker 从末尾反向切片抢占，最大化避免与正向主 Worker 碰撞
+    rev_pending = list(reversed(pending_seqs))
+    primary_queue = rev_pending[SHARD_IDX::NUM_SHARDS]
+    fallback_tail = [s for s in rev_pending if s not in primary_queue]
+    worker_seq_queue = primary_queue + fallback_tail
+else:
+    # 常规分片 Worker: 先执行固定分片 pending_seqs[shard_idx::num_shards]，若提前跑完再从末尾反向协助剩余未认领序列
+    primary_queue = pending_seqs[SHARD_IDX::NUM_SHARDS]
+    fallback_tail = [s for s in reversed(pending_seqs) if s not in primary_queue] if NUM_SHARDS > 1 else []
+    worker_seq_queue = primary_queue + fallback_tail
+
+print(
+    f"[{TRACKER_NAME} | {WORKER_TAG}] 启动分片推理 | primary_slice={len(primary_queue)} 条 "
+    f"| total_pending={len(pending_seqs)} 条 | dynamic_helper={IS_DYNAMIC_HELPER}"
+)
+
+# 2. 构建统一单帧步进跟踪器接口
 class UnifiedTrackerStepper:
     def __init__(self):
         self.adapter = ADAPTER_TYPE
@@ -826,7 +1249,7 @@ class UnifiedTrackerStepper:
             if not ckpt_p.exists():
                 ckpt_p = siamdt_dir / "checkpoints" / PRIMARY_WEIGHT
             transforms = data.BasicPairTransforms(train=False)
-            self.tracker = SiamDTTracker(DEFAULT_CFG, str(ckpt_p), transforms, name_suffix=TRACKER_NAME, visualize=False)
+            self.tracker = SiamDTTracker(DEFAULT_CFG, str(ckpt_p), transforms, name_suffix=f"{TRACKER_NAME}_{WORKER_TAG}", visualize=False)
 
         elif self.adapter == "pytracking_ostrack_family":
             import cv2
@@ -835,7 +1258,6 @@ class UnifiedTrackerStepper:
             param_mod = import_module(f"lib.test.parameter.{TRACKER_MOD}")
             tracker_mod = import_module(f"lib.test.tracker.{TRACKER_MOD}")
             params = param_mod.parameters(DEFAULT_CFG)
-            # 自动绑定 weight_dir 下找到的权重文件
             ckpts = sorted([
                 p for p in WEIGHT_DIR.rglob("*")
                 if p.is_file() and p.suffix.lower() in (".tar", ".pth", ".pt")
@@ -863,11 +1285,9 @@ class UnifiedTrackerStepper:
         elif self.adapter == "trackit_memlotrack":
             import cv2
             self.cv2 = cv2
-            # MemLoTrack 支持通过 trackit 模型或批量推理导入
             self.weight_files = sorted([p for p in WEIGHT_DIR.rglob("*.bin")] + [p for p in WEIGHT_DIR.rglob("*.safetensors")])
 
     def run_sequence(self, seq_dir: Path, frames: list, gt0: list):
-        """对单条序列执行从第0帧初始化到末帧的完整 OPE 推理，返回 (pred_boxes, confs, up_flags, lats_ms)。"""
         pred_boxes = [gt0]
         confs = [1.0]
         up_flags = [True]
@@ -900,7 +1320,6 @@ class UnifiedTrackerStepper:
 
         elif self.adapter == "pytracking_ostrack_family":
             img0 = self.cv2.cvtColor(self.cv2.imread(str(frames[0])), self.cv2.COLOR_BGR2RGB)
-            # 若为多模态 6 通道输入 (SUTrack / UETrack / UTPTrack-S)，自动拼接双路三通道红外帧 [RGB, TIR]
             if TRACKER_NAME in ("SUTrack", "UETrack", "UTPTrack-S"):
                 img0_in = np.concatenate([img0, img0], axis=2)
             else:
@@ -954,88 +1373,150 @@ class UnifiedTrackerStepper:
         else:
             raise RuntimeError(f"Adapter {self.adapter} 需要通过专用批量入口或 --ingest-raw-txt-dir 执行。")
 
-stepper = UnifiedTrackerStepper()
+stepper = None
 
-for idx, seq_id in enumerate(pending_seqs, start=1):
-    seq_dir = DATASET_DIR / seq_id
-    lbl_file = seq_dir / "IR_label.json"
-    if not lbl_file.exists():
-        print(f"[警告] 序列 {seq_id} 尚未同步至 {seq_dir}，跳过。")
-        continue
-    lbl = json.loads(lbl_file.read_text(encoding="utf-8"))
-    gt_rects = lbl["gt_rect"]
-    exist_flags = lbl.get("exist", [1] * len(gt_rects))
-    frames = sorted(seq_dir.glob("*.jpg"))
-    total_f = min(len(frames), len(gt_rects))
-    if total_f == 0:
+for seq_id in worker_seq_queue:
+    # 启动前再次双重检查 .jsonl 与 .lock，防止与其他分片或动态补位 Worker 冲突
+    if not try_acquire_seq_lock(seq_id):
         continue
 
-    gt0 = [float(x) for x in gt_rects[0][:4]]
-    pred_boxes, confs, up_flags, lats_ms = stepper.run_sequence(seq_dir, frames[:total_f], gt0)
+    try:
+        seq_dir = DATASET_DIR / seq_id
+        lbl_file = seq_dir / "IR_label.json"
+        if not lbl_file.exists():
+            print(f"[{TRACKER_NAME} | {WORKER_TAG}] 序列 {seq_id} 缺少 IR_label.json，跳过。")
+            continue
+        lbl = json.loads(lbl_file.read_text(encoding="utf-8"))
+        gt_rects = lbl["gt_rect"]
+        exist_flags = lbl.get("exist", [1] * len(gt_rects))
+        frames = sorted(seq_dir.glob("*.jpg"))
+        total_f = min(len(frames), len(gt_rects))
+        if total_f < len(gt_rects) or total_f == 0:
+            print(f"[{TRACKER_NAME} | {WORKER_TAG}] 序列 {seq_id} JPG 帧数 ({len(frames)}) 未齐备 (期望 {len(gt_rects)})，跳过。")
+            continue
 
-    telemetry_rows = []
-    for f in range(total_f):
-        pb = pred_boxes[f]
-        gb = [float(x) for x in gt_rects[f][:4]] if len(gt_rects[f]) >= 4 else [0.0, 0.0, 0.0, 0.0]
-        ex = int(exist_flags[f])
-        p_abs = 1 if (pb[2] <= 0.0 or pb[3] <= 0.0) else 0
-        if ex == 1 and gb[2] > 0.0 and gb[3] > 0.0:
-            iou_f = calc_iou_xywh(pb, gb) if p_abs == 0 else 0.0
-            sa_f = iou_f
-            if p_abs == 0:
-                ce_f = math.hypot((pb[0] + 0.5 * pb[2]) - (gb[0] + 0.5 * gb[2]), (pb[1] + 0.5 * pb[3]) - (gb[1] + 0.5 * gb[3]))
-                ts_f = math.sqrt(max(1e-6, gb[2] * gb[3]))
-                nce_f = ce_f / ts_f
+        if stepper is None:
+            stepper = UnifiedTrackerStepper()
+
+        gt0 = [float(x) for x in gt_rects[0][:4]]
+        pred_boxes, confs, up_flags, lats_ms = stepper.run_sequence(seq_dir, frames[:total_f], gt0)
+
+        telemetry_rows = []
+        for f in range(total_f):
+            pb = pred_boxes[f]
+            gb = [float(x) for x in gt_rects[f][:4]] if len(gt_rects[f]) >= 4 else [0.0, 0.0, 0.0, 0.0]
+            ex = int(exist_flags[f])
+            p_abs = 1 if (pb[2] <= 0.0 or pb[3] <= 0.0) else 0
+            if ex == 1 and gb[2] > 0.0 and gb[3] > 0.0:
+                iou_f = calc_iou_xywh(pb, gb) if p_abs == 0 else 0.0
+                sa_f = iou_f
+                if p_abs == 0:
+                    ce_f = math.hypot((pb[0] + 0.5 * pb[2]) - (gb[0] + 0.5 * gb[2]), (pb[1] + 0.5 * pb[3]) - (gb[1] + 0.5 * gb[3]))
+                    ts_f = math.sqrt(max(1e-6, gb[2] * gb[3]))
+                    nce_f = ce_f / ts_f
+                else:
+                    ce_f, ts_f, nce_f = -1.0, math.sqrt(max(1e-6, gb[2] * gb[3])), -1.0
             else:
-                ce_f, ts_f, nce_f = -1.0, math.sqrt(max(1e-6, gb[2] * gb[3])), -1.0
-        else:
-            iou_f = 0.0
-            sa_f = 1.0 if p_abs == 1 else 0.0
-            ce_f, nce_f, ts_f = -1.0, -1.0, 0.0
+                iou_f = 0.0
+                sa_f = 1.0 if p_abs == 1 else 0.0
+                ce_f, nce_f, ts_f = -1.0, -1.0, 0.0
 
-        telemetry_rows.append({
-            "seq_id": seq_id,
-            "frame_id": f,
-            "exist": ex,
-            "gt_bbox": gb,
-            "pred_bbox": pb,
-            "pred_absent_flag": p_abs,
-            "iou": round(iou_f, 6),
-            "sa_score": round(sa_f, 6),
-            "center_error": round(ce_f, 4),
-            "norm_center_error": round(nce_f, 4),
-            "target_size": round(ts_f, 4),
-            "confidence": round(float(confs[f]), 6),
-            "template_updated": bool(up_flags[f]),
-            "latency_ms": round(float(lats_ms[f]), 3),
-        })
+            telemetry_rows.append({
+                "seq_id": seq_id,
+                "frame_id": f,
+                "exist": ex,
+                "gt_bbox": gb,
+                "pred_bbox": pb,
+                "pred_absent_flag": p_abs,
+                "iou": round(iou_f, 6),
+                "sa_score": round(sa_f, 6),
+                "center_error": round(ce_f, 4),
+                "norm_center_error": round(nce_f, 4),
+                "target_size": round(ts_f, 4),
+                "confidence": round(float(confs[f]), 6),
+                "template_updated": bool(up_flags[f]),
+                "latency_ms": round(float(lats_ms[f]), 3),
+            })
 
-    txt_content = "\n".join([f"{b[0]:.3f},{b[1]:.3f},{b[2]:.3f},{b[3]:.3f}" for b in pred_boxes]) + "\n"
-    uavtir_json_content = json.dumps({"res": pred_boxes})
-    jsonl_content = "\n".join([json.dumps(r, ensure_ascii=False) for r in telemetry_rows]) + "\n"
+        txt_content = "\n".join([f"{b[0]:.3f},{b[1]:.3f},{b[2]:.3f},{b[3]:.3f}" for b in pred_boxes]) + "\n"
+        uavtir_json_content = json.dumps({"res": pred_boxes})
+        jsonl_content = "\n".join([json.dumps(r, ensure_ascii=False) for r in telemetry_rows]) + "\n"
 
-    fsync_write(txt_box_dir / f"{seq_id}.txt", txt_content)
-    fsync_write(uavtir_json_dir / f"{seq_id}.txt", uavtir_json_content)
-    fsync_write(telemetry_eval_dir / f"{seq_id}.jsonl", jsonl_content)
-    fsync_write(telemetry_diag_dir / f"{seq_id}.jsonl", jsonl_content)
+        fsync_write(txt_box_dir / f"{seq_id}.txt", txt_content)
+        fsync_write(uavtir_json_dir / f"{seq_id}.txt", uavtir_json_content)
+        fsync_write(telemetry_eval_dir / f"{seq_id}.jsonl", jsonl_content)
+        fsync_write(telemetry_diag_dir / f"{seq_id}.jsonl", jsonl_content)
 
-    seq_sa = float(np.mean([r["sa_score"] for r in telemetry_rows]))
-    seq_sa_scores[seq_id] = seq_sa
-    print(f"[{TRACKER_NAME} | {idx}/{len(pending_seqs)}] 序列 {seq_id} ({total_f} 帧) 落盘完成 | SA={seq_sa:.4f}")
-
-    summary_payload = {
-        "tracker_name": TRACKER_NAME,
-        "tracker_group": TRACKER_GROUP,
-        "split_name": split_stem,
-        "stage_git_sha": GIT_SHA,
-        "completed_sequences_count": len(seq_sa_scores),
-        "total_target_sequences": len(seq_list),
-        "mean_sa_score": round(float(np.mean(list(seq_sa_scores.values()))), 6) if seq_sa_scores else 0.0,
-        "per_sequence_sa": seq_sa_scores,
-        "updated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    }
-    fsync_write(eval_root / "eval_progress_summary.json", json.dumps(summary_payload, indent=2, ensure_ascii=False))
+        seq_sa = float(np.mean([r["sa_score"] for r in telemetry_rows]))
+        print(f"[{TRACKER_NAME} | {WORKER_TAG}] 序列 {seq_id} ({total_f} 帧) 落盘完成 | SA={seq_sa:.4f}")
+    finally:
+        release_seq_lock(seq_id)
 '''
+
+
+def _spawn_tracker_shard_worker(
+    tracker_name: str,
+    shard_idx: int,
+    num_shards: int,
+    dynamic_helper: bool,
+    slot_id: int,
+    drive_root: Path,
+    runtime_root: Path,
+    split_json_path: Path,
+    dataset_val_dir: Path,
+    max_sequences: int,
+    git_short_sha: str,
+) -> Tuple[subprocess.Popen, Dict[str, Any]]:
+    """启动单个算法分片子进程并返回 `(Popen, job_meta)`。"""
+    spec = TRACKER_REGISTRY[tracker_name]
+    py_bin = spec["python_bin_colab"] if Path(spec["python_bin_colab"]).exists() else sys.executable
+    repo_dir = (
+        (runtime_root / spec["repo_rel_dir"])
+        if (runtime_root / spec["repo_rel_dir"]).exists()
+        else (drive_root / spec["repo_rel_dir"])
+    )
+    weight_dir = drive_root / spec["weight_rel_dir"]
+    worker_tag = (
+        f"dyn_helper_slot{slot_id}_s{shard_idx}of{num_shards}"
+        if dynamic_helper
+        else f"slot{slot_id}_s{shard_idx}of{num_shards}"
+    )
+
+    worker_code = _build_worker_script_for_tracker(tracker_name, spec)
+    env = os.environ.copy()
+    env.update({
+        "_P2_DRIVE_ROOT": str(drive_root),
+        "_P2_RUNTIME_ROOT": str(runtime_root),
+        "_P2_TRACKER_NAME": tracker_name,
+        "_P2_TRACKER_GROUP": spec["group"],
+        "_P2_ADAPTER_TYPE": spec["adapter_type"],
+        "_P2_REPO_DIR": str(repo_dir),
+        "_P2_WEIGHT_DIR": str(weight_dir),
+        "_P2_PRIMARY_WEIGHT": spec["primary_weight_file"],
+        "_P2_DEFAULT_CFG": spec["default_config"],
+        "_P2_TRACKER_MOD": spec.get("tracker_module", ""),
+        "_P2_SPLIT_JSON": str(split_json_path),
+        "_P2_DATASET_DIR": str(dataset_val_dir),
+        "_P2_GIT_SHA": git_short_sha,
+        "_P2_MAX_SEQS": str(max_sequences),
+        "_P2_SHARD_IDX": str(shard_idx),
+        "_P2_NUM_SHARDS": str(num_shards),
+        "_P2_DYNAMIC_HELPER": "1" if dynamic_helper else "0",
+        "_P2_WORKER_TAG": worker_tag,
+    })
+
+    proc = subprocess.Popen([py_bin, "-c", worker_code], env=env)
+    meta = {
+        "slot_id": slot_id,
+        "tracker_name": tracker_name,
+        "shard_idx": shard_idx,
+        "num_shards": num_shards,
+        "dynamic_helper": dynamic_helper,
+        "worker_tag": worker_tag,
+        "pid": proc.pid,
+        "started_at": time.time(),
+    }
+    return proc, meta
 
 
 def execute_multi_tracker_eval(
@@ -1043,71 +1524,272 @@ def execute_multi_tracker_eval(
     runtime_root: Path,
     split_json_path: Path,
     selected_trackers: List[str],
+    concurrency_mode: str = "hybrid_b_then_a",
+    requested_gpu_slots: int = 0,
     max_sequences: int = 0,
     git_short_sha: str = "phase2",
     dry_run: bool = False,
 ) -> Dict[str, Any]:
-    """在 Colab A100/L4 上按顺序调度所选跟踪器执行统一评测并实时写入 `.jsonl` 遥测。"""
+    """
+    在 Colab A100/L4 上执行混合并发统一评测 (`hybrid_b_then_a`):
+      1. 自动探测或使用 `--gpu-slots` 确定总算力槽位数 S；
+      2. 实时扫描各算法未完成序列，生成方案 B (多算法并发) + 方案 A (多视频分片补位) 混合调度计划；
+      3. 运行期通过动态进程池监控：一旦快算法跑完腾出空闲槽位，而慢算法仍有 > 4 条未完成序列，
+         立即在空闲槽位派生方案 A 动态补位 Worker；
+      4. 所有分片完成后统一汇总生成各算法的 `eval_progress_summary.json`。
+    """
+    if concurrency_mode not in CONCURRENCY_MODES:
+        raise ValueError(f"不支持的 concurrency_mode: {concurrency_mode}，可选: {CONCURRENCY_MODES}")
+
+    gpu_slot_info = detect_optimal_gpu_slots(requested_gpu_slots)
+    S = int(gpu_slot_info["effective_gpu_slots"])
+
+    all_seqs, split_meta = load_split_sequences(split_json_path)
+    split_stem = split_meta.get("split_name", split_json_path.stem)
+    target_seqs = all_seqs[:max_sequences] if max_sequences > 0 else all_seqs
+    expected_frames_map = {
+        item["seq_name"]: int(item.get("frames", 0))
+        for item in split_meta.get("sequence_details", [])
+        if "seq_name" in item
+    }
     dataset_val_dir = drive_root / "datasets/AntiUAV410/val"
-    core40_tar = drive_root / "datasets/archives/AntiUAV410_Core40_val.tar"
-    runtime_val_dir = runtime_root / "datasets/AntiUAV410/val"
-    if not dry_run and core40_tar.exists() and str(runtime_root).startswith("/content"):
-        marker = runtime_val_dir / ".core40_extracted"
-        if not marker.exists():
-            print(f"[NVMe 极速预热] 正在将 {core40_tar.name} 解压至本地高速盘 {runtime_val_dir} ...")
-            runtime_val_dir.mkdir(parents=True, exist_ok=True)
-            import tarfile
-            with tarfile.open(core40_tar, "r") as tf:
-                tf.extractall(path=runtime_val_dir)
-            marker.write_text("ok", encoding="utf-8")
-        dataset_val_dir = runtime_val_dir
-    exec_logs: Dict[str, Any] = {}
 
+    # 扫描每个被选算法的实时已完成与待评测序列
+    tracker_pending_map: Dict[str, List[str]] = {}
+    tracker_completed_map: Dict[str, List[str]] = {}
     for tk in selected_trackers:
-        spec = TRACKER_REGISTRY[tk]
-        py_bin = spec["python_bin_colab"] if Path(spec["python_bin_colab"]).exists() else sys.executable
-        repo_dir = (runtime_root / spec["repo_rel_dir"]) if (runtime_root / spec["repo_rel_dir"]).exists() else (drive_root / spec["repo_rel_dir"])
-        weight_dir = drive_root / spec["weight_rel_dir"]
+        comp, unfin, _ = scan_realtime_pending_sequences(
+            drive_root=drive_root,
+            dataset_val_dir=dataset_val_dir,
+            tracker_name=tk,
+            split_stem=split_stem,
+            target_sequences=target_seqs,
+            git_short_sha=git_short_sha,
+            expected_frames_map=expected_frames_map,
+        )
+        tracker_completed_map[tk] = comp
+        tracker_pending_map[tk] = unfin
 
-        if dry_run:
-            exec_logs[tk] = {
-                "mode": "DRY_RUN",
-                "python_bin": py_bin,
-                "repo_dir": str(repo_dir),
-                "weight_dir": str(weight_dir),
-                "split_json": str(split_json_path),
-            }
-            continue
+    # 生成初始并发波次与混合补位计划表
+    schedule_plan = build_hybrid_schedule_plan(
+        tracker_pending_map=tracker_pending_map,
+        gpu_slots=S,
+        concurrency_mode=concurrency_mode,
+    )
 
-        worker_code = _build_worker_script_for_tracker(tk, spec)
-        env = os.environ.copy()
-        env.update({
-            "_P2_DRIVE_ROOT": str(drive_root),
-            "_P2_RUNTIME_ROOT": str(runtime_root),
-            "_P2_TRACKER_NAME": tk,
-            "_P2_TRACKER_GROUP": spec["group"],
-            "_P2_ADAPTER_TYPE": spec["adapter_type"],
-            "_P2_REPO_DIR": str(repo_dir),
-            "_P2_WEIGHT_DIR": str(weight_dir),
-            "_P2_PRIMARY_WEIGHT": spec["primary_weight_file"],
-            "_P2_DEFAULT_CFG": spec["default_config"],
-            "_P2_TRACKER_MOD": spec.get("tracker_module", ""),
-            "_P2_SPLIT_JSON": str(split_json_path),
-            "_P2_DATASET_DIR": str(dataset_val_dir),
-            "_P2_GIT_SHA": git_short_sha,
-            "_P2_MAX_SEQS": str(max_sequences),
-        })
+    if dry_run:
+        # 构造详细的 Dry-Run 验证报告（同时模拟展示：若 M >= S 时 Wave 1 方案 B 满载 + Wave 2 方案 A 动态补位触发演练，
+        # 以及当 M < S 时直接触发方案 A 分片补位的对照预演）
+        single_tracker_example = {selected_trackers[0]: tracker_pending_map[selected_trackers[0]]} if selected_trackers else {}
+        plan_a_backfill_demo = build_hybrid_schedule_plan(
+            tracker_pending_map=single_tracker_example,
+            gpu_slots=S,
+            concurrency_mode=concurrency_mode,
+        ) if single_tracker_example else {}
 
-        print(f"\n>>> 启动 [{tk}] ({spec['track_label']}) 统一评测 | Split={split_json_path.name} <<<")
-        t0 = time.time()
-        ret = subprocess.run([py_bin, "-c", worker_code], env=env, check=False)
-        elapsed = round(time.time() - t0, 2)
-        exec_logs[tk] = {
-            "returncode": ret.returncode,
-            "elapsed_sec": elapsed,
+        return {
+            "action": "eval",
+            "mode": "DRY_RUN_HYBRID_SCHEDULE_VERIFIED",
+            "split_name": split_stem,
+            "target_sequences_count": len(target_seqs),
+            "gpu_slot_detection": gpu_slot_info,
+            "selected_trackers_count": len(selected_trackers),
+            "per_tracker_pending_counts": {tk: len(tracker_pending_map[tk]) for tk in selected_trackers},
+            "hybrid_schedule_plan": schedule_plan,
+            "plan_a_backfill_when_M_lt_S_preview": plan_a_backfill_demo,
         }
 
-    return exec_logs
+    # 正式并发执行循环
+    active_procs: List[Tuple[subprocess.Popen, Dict[str, Any]]] = []
+    occupied_slots: Dict[int, str] = {}
+    completed_worker_logs: List[Dict[str, Any]] = []
+    dynamic_backfill_events: List[Dict[str, Any]] = []
+    helper_counter_per_tracker: Dict[str, int] = {tk: 0 for tk in selected_trackers}
+
+    # 1. 启动 Wave 1 初始并发作业
+    for job in schedule_plan["initial_wave_jobs"]:
+        slot_id = int(job["slot_id"])
+        tk = str(job["tracker_name"])
+        proc, meta = _spawn_tracker_shard_worker(
+            tracker_name=tk,
+            shard_idx=int(job["shard_idx"]),
+            num_shards=int(job["num_shards"]),
+            dynamic_helper=bool(job["dynamic_helper"]),
+            slot_id=slot_id,
+            drive_root=drive_root,
+            runtime_root=runtime_root,
+            split_json_path=split_json_path,
+            dataset_val_dir=dataset_val_dir,
+            max_sequences=max_sequences,
+            git_short_sha=git_short_sha,
+        )
+        active_procs.append((proc, meta))
+        occupied_slots[slot_id] = tk
+
+    queued_trackers: List[str] = list(schedule_plan["queued_trackers_after_wave1"])
+
+    # 2. 动态进程池监控与方案 B -> 方案 A 自动补位循环
+    while active_procs or queued_trackers:
+        time.sleep(0.5)
+        still_running: List[Tuple[subprocess.Popen, Dict[str, Any]]] = []
+        freed_slots: List[int] = []
+
+        for proc, meta in active_procs:
+            ret = proc.poll()
+            if ret is None:
+                still_running.append((proc, meta))
+            else:
+                slot_id = int(meta["slot_id"])
+                freed_slots.append(slot_id)
+                occupied_slots.pop(slot_id, None)
+                meta_done = dict(meta)
+                meta_done["returncode"] = ret
+                meta_done["elapsed_sec"] = round(time.time() - float(meta["started_at"]), 2)
+                completed_worker_logs.append(meta_done)
+
+        active_procs = still_running
+
+        if not freed_slots:
+            continue
+
+        # 优先阶段 1：若等待队列 queued_trackers 中仍有未启动算法，优先按方案 B（或尾盘分片）填补空闲槽位
+        while freed_slots and queued_trackers:
+            next_tk = queued_trackers.pop(0)
+            _, unfin, _ = scan_realtime_pending_sequences(
+                drive_root=drive_root,
+                dataset_val_dir=dataset_val_dir,
+                tracker_name=next_tk,
+                split_stem=split_stem,
+                target_sequences=target_seqs,
+                git_short_sha=git_short_sha,
+                expected_frames_map=expected_frames_map,
+            )
+            if not unfin:
+                continue
+
+            if concurrency_mode == "plan_a_seq_shards":
+                # plan_a 模式下，当前算法独占所有空闲槽位分片运行
+                k_shards = min(len(freed_slots), len(unfin))
+                for s_idx in range(k_shards):
+                    s_slot = freed_slots.pop(0)
+                    p, m = _spawn_tracker_shard_worker(
+                        tracker_name=next_tk,
+                        shard_idx=s_idx,
+                        num_shards=k_shards,
+                        dynamic_helper=False,
+                        slot_id=s_slot,
+                        drive_root=drive_root,
+                        runtime_root=runtime_root,
+                        split_json_path=split_json_path,
+                        dataset_val_dir=dataset_val_dir,
+                        max_sequences=max_sequences,
+                        git_short_sha=git_short_sha,
+                    )
+                    active_procs.append((p, m))
+                    occupied_slots[s_slot] = next_tk
+            else:
+                # 方案 B：启动下一个待测算法
+                s_slot = freed_slots.pop(0)
+                p, m = _spawn_tracker_shard_worker(
+                    tracker_name=next_tk,
+                    shard_idx=0,
+                    num_shards=1,
+                    dynamic_helper=False,
+                    slot_id=s_slot,
+                    drive_root=drive_root,
+                    runtime_root=runtime_root,
+                    split_json_path=split_json_path,
+                    dataset_val_dir=dataset_val_dir,
+                    max_sequences=max_sequences,
+                    git_short_sha=git_short_sha,
+                )
+                active_procs.append((p, m))
+                occupied_slots[s_slot] = next_tk
+
+        # 优先阶段 2 (方案 A 动态补位)：当 queued_trackers 已空且仍有空闲槽位 freed_slots 时，
+        # 实时扫描正在运行的慢算法的 `telemetry_eval_dir/*.jsonl`；若某个慢算法仍有 > 4 条未完成序列，
+        # 立即在空闲槽位上为该慢算法派生补充的方案 A 分片 Worker！
+        if freed_slots and concurrency_mode == "hybrid_b_then_a" and active_procs:
+            running_tks = sorted({str(m["tracker_name"]) for _, m in active_procs})
+            for s_slot in list(freed_slots):
+                # 实时统计各活跃算法的剩余未完成序列数与未锁定序列数
+                candidates: List[Tuple[int, int, str]] = []
+                for rtk in running_tks:
+                    _, unfin, unclaimed = scan_realtime_pending_sequences(
+                        drive_root=drive_root,
+                        dataset_val_dir=dataset_val_dir,
+                        tracker_name=rtk,
+                        split_stem=split_stem,
+                        target_sequences=target_seqs,
+                        git_short_sha=git_short_sha,
+                        expected_frames_map=expected_frames_map,
+                    )
+                    cur_workers_for_rtk = sum(1 for _, m in active_procs if m["tracker_name"] == rtk)
+                    # 严格执行阈值条件：慢算法还有超过 4 条未完成序列，且存在尚未被锁定的剩余序列
+                    if len(unfin) > DYNAMIC_BACKFILL_MIN_REMAINING_SEQS and len(unclaimed) > 0:
+                        candidates.append((len(unfin), -cur_workers_for_rtk, rtk))
+
+                if not candidates:
+                    break
+
+                # 选择剩余未完成序列最多的慢算法派生方案 A 补位 Worker
+                candidates.sort(reverse=True)
+                best_unfin_cnt, _, slow_tk = candidates[0]
+                freed_slots.remove(s_slot)
+                helper_idx = helper_counter_per_tracker.get(slow_tk, 0)
+                helper_counter_per_tracker[slow_tk] = helper_idx + 1
+                cur_workers_total = sum(1 for _, m in active_procs if m["tracker_name"] == slow_tk) + 1
+
+                p, m = _spawn_tracker_shard_worker(
+                    tracker_name=slow_tk,
+                    shard_idx=helper_idx,
+                    num_shards=max(2, cur_workers_total),
+                    dynamic_helper=True,
+                    slot_id=s_slot,
+                    drive_root=drive_root,
+                    runtime_root=runtime_root,
+                    split_json_path=split_json_path,
+                    dataset_val_dir=dataset_val_dir,
+                    max_sequences=max_sequences,
+                    git_short_sha=git_short_sha,
+                )
+                active_procs.append((p, m))
+                occupied_slots[s_slot] = slow_tk
+                backfill_evt = {
+                    "slot_id": s_slot,
+                    "slow_tracker": slow_tk,
+                    "remaining_unfinished_sequences_at_spawn": best_unfin_cnt,
+                    "helper_worker_tag": m["worker_tag"],
+                    "pid": m["pid"],
+                    "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                }
+                dynamic_backfill_events.append(backfill_evt)
+                print(
+                    f"[Hybrid B->A 动态补位] 空闲槽位 Slot-{s_slot} 已为慢算法 [{slow_tk}] "
+                    f"(剩余 {best_unfin_cnt} 条未完成序列 > 4) 派生分片 Worker ({m['worker_tag']}, PID={m['pid']})"
+                )
+
+    # 3. 全部 Worker 结束后，统一汇总生成各算法的 eval_progress_summary.json
+    final_summaries: Dict[str, Any] = {}
+    for tk in selected_trackers:
+        final_summaries[tk] = finalize_tracker_eval_summary(
+            drive_root=drive_root,
+            tracker_name=tk,
+            split_stem=split_stem,
+            target_sequences=target_seqs,
+            git_short_sha=git_short_sha,
+        )
+
+    return {
+        "action": "eval",
+        "concurrency_mode": concurrency_mode,
+        "gpu_slot_detection": gpu_slot_info,
+        "initial_schedule_plan": schedule_plan,
+        "dynamic_plan_a_backfill_events": dynamic_backfill_events,
+        "completed_workers_count": len(completed_worker_logs),
+        "completed_workers": completed_worker_logs,
+        "tracker_final_summaries": final_summaries,
+    }
 
 
 # ==============================================================================
@@ -1115,7 +1797,7 @@ def execute_multi_tracker_eval(
 # ==============================================================================
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Phase 2 Colab A100/L4 多算法统一评测与权重拉取调度器"
+        description="Phase 2 Colab A100/L4 多算法统一评测与混合并发调度器 (方案 B 优先 + 方案 A 自动补位)"
     )
     parser.add_argument(
         "--action",
@@ -1136,10 +1818,22 @@ def main() -> None:
         help="冻结子集 JSON 文件名或路径 (默认: discovery_set.json，可选: holdout_verification.json / val90_full.json)",
     )
     parser.add_argument(
+        "--concurrency-mode",
+        choices=list(CONCURRENCY_MODES),
+        default="hybrid_b_then_a",
+        help="并发调度模式: hybrid_b_then_a (默认: 方案B多算法同卡并发优先 + 方案A单算法多视频分片自动补位) | plan_b_multi_tracker | plan_a_seq_shards | serial",
+    )
+    parser.add_argument(
+        "--gpu-slots",
+        type=int,
+        default=0,
+        help="GPU 并发槽位数 S (默认 0 表示按显存自动检测: A100 80GB->6, A100 40GB->4, L4 24GB->2, 其他->1)",
+    )
+    parser.add_argument(
         "--drive-root",
         type=Path,
         default=None,
-        help="Google Drive 持久化根目录 (默认自动检测 /content/drive/MyDrive/SiamDT_Project 或 G:/我的云端硬盘/SiamDT_Project)",
+        help="Google Drive 持久化根目录 (默认自动检测 /content/drive/MyDrive/SiamDT_Project 或 Z:/SiamDT_Project)",
     )
     parser.add_argument(
         "--runtime-root",
@@ -1167,7 +1861,7 @@ def main() -> None:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="仅验证调度配置与输出路径，不实际启动 GPU 推理",
+        help="仅验证混合并发调度计划表与输出路径，不实际启动 GPU 推理进程",
     )
     args = parser.parse_args()
 
@@ -1211,6 +1905,8 @@ def main() -> None:
             runtime_root=args.runtime_root,
             split_json_path=split_json_path,
             selected_trackers=selected_trackers,
+            concurrency_mode=args.concurrency_mode,
+            requested_gpu_slots=args.gpu_slots,
             max_sequences=args.max_sequences,
             dry_run=args.dry_run,
         )

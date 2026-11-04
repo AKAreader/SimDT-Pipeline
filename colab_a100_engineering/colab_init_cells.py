@@ -12,6 +12,29 @@ SimDT 围点打援 (SiamDT + Multi-Tracker Benchmark on Anti-UAV410)
 """
 
 # ==============================================================================
+# [CELL 0] 一键开启本地总控远程接管模式 (Colab Remote Bridge)
+# ==============================================================================
+CELL_0_REMOTE_BRIDGE = r'''
+import os
+import runpy
+import sys
+from pathlib import Path
+
+try:
+    from google.colab import drive
+    if not os.path.ismount('/content/drive'):
+        drive.mount('/content/drive')
+except ImportError:
+    print("[提示] 当前非 Google Colab 交互环境，跳过 drive.mount。")
+
+DRIVE_ROOT = Path(os.environ.get("SIAMDT_DRIVE_ROOT", "/content/drive/MyDrive/SiamDT_Project"))
+BRIDGE_SCRIPT = DRIVE_ROOT / "colab/colab_remote_bridge.py"
+assert BRIDGE_SCRIPT.exists(), f"未找到远程接管脚本: {BRIDGE_SCRIPT}"
+sys.argv = [str(BRIDGE_SCRIPT), "--drive-root", str(DRIVE_ROOT)]
+runpy.run_path(str(BRIDGE_SCRIPT), run_name="__main__")
+'''
+
+# ==============================================================================
 # [CELL 1] 挂载 Google Drive 与建立持久化金库目录树（零覆盖资产扫描与无损复用）
 # ==============================================================================
 CELL_1_MOUNT_AND_LAYOUT = r'''
@@ -78,6 +101,8 @@ REQUIRED_DIRS = [
     "experiments/failure_diagnosis/reports",
     # Colab 脚本与工程文档
     "colab",
+    "colab/bridge/cmd_queue/processed",
+    "colab/bridge/cmd_results",
     "docs",
 ]
 
@@ -1393,6 +1418,7 @@ else:
 '''
 
 ALL_COLAB_CELLS = [
+    ("CELL 0｜一键开启本地总控 AI 全自动远程接管模式", CELL_0_REMOTE_BRIDGE),
     ("CELL 1｜挂载 Google Drive 与建立持久化金库目录树", CELL_1_MOUNT_AND_LAYOUT),
     ("CELL 2｜双源 Git 同步（GitHub 阶段代码库 + 官方 Anti-UAV410 锁定仓库）", CELL_2_DUAL_GIT_SYNC_AND_PATCH),
     ("CELL 3｜数据集与多算法权重完整性核验（SHA-256 校验与软链接）", CELL_3_ASSETS_VERIFY_AND_PREPARE),
