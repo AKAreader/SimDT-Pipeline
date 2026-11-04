@@ -748,6 +748,12 @@ class ColabRemoteBridge:
             print("[警告] 已启用 --allow-raw-shell：raw_shell 动作可执行任意 shell 命令，仅限调试，用完请重启桥并关闭该开关。", flush=True)
         hb = self.write_heartbeat_once()
         threading.Thread(target=self._heartbeat_loop, daemon=True).start()
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            import colab_ntfy_telemetry as _ntfy_telem
+            _ntfy_telem.ensure_daemon_started()
+        except Exception:
+            pass
         print(f"[接管已就绪] Bridge v{BRIDGE_VERSION} | GPU: {hb['gpu_name']} | 通道: {hb['channels_active']} | 心跳 {self.heartbeat_interval_sec:.0f}s\n"
               f"[Bridge-Info] Queue: {self.cmd_queue_dir}\n[Bridge-Info] Results: {self.cmd_results_dir}\n"
               f"[Bridge-Info] 停止: 写入 {self.stop_files[0]}（或本地 Cell 0b）", flush=True)

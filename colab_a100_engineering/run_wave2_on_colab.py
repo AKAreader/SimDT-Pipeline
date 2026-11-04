@@ -284,6 +284,14 @@ def main() -> None:
     try:
         eval_script = str(PIPELINE_DIR / "phase2_unified_eval/run_phase2_multi_tracker_colab.py")
 
+        # Step 0 (if VM was reset after Colab disconnect): Ensure local NVMe dataset cache is staged
+        val_cache = RUNTIME_ROOT / "antiuav410_val"
+        if not val_cache.exists() or len(list(val_cache.glob("*/IR_label.json"))) < 24:
+            _run_step(1, "Step 0/4: 恢复重连后 Colab 本地高速盘数据集缓存 (Cells 1-3)", [
+                sys.executable, str(PIPELINE_DIR / "colab_a100_engineering/colab_init_cells.py"),
+                "--run-cell", "1,2,3",
+            ])
+
         # Step 1: Stage repos and verify weights for all 10 trackers
         _run_step(1, steps_plan[0][0], [
             sys.executable, eval_script,
