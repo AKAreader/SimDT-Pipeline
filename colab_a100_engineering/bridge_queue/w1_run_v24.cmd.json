@@ -1,0 +1,8 @@
+{
+  "cmd_id": "w1_run_v24",
+  "action": "run_wave1",
+  "args": [],
+  "params": {},
+  "timeout_sec": 21600,
+  "note": "Fix visdom pkg_resources build isolation (--no-build-isolation) and execute Wave 1 Step 2-5"
+}

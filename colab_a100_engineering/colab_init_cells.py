@@ -708,11 +708,15 @@ PY1="$SIAMDT_ENV/bin/python"
 # 幂等检查：若已通过全套导入门禁则直接跳过安装
 if ! "$PY1" -c "import torch, torchvision, mmcv, timm, shapely, visdom; from mmcv.ops import nms, roi_align; assert torch.__version__=='2.0.0+cu118' and mmcv.__version__=='1.7.2'" 2>/dev/null; then
     echo "[Tier-1: env_siamdt_cu118] 正在构建恢复 SiamDT 专用环境..."
-    "$UV" pip install --python "$PY1" setuptools==68.2.2 wheel==0.41.3 cython==0.29.35 yapf==0.40.1
-    "$UV" pip install --python "$PY1" torch==2.0.0+cu118 torchvision==0.15.1+cu118 --index-url https://download.pytorch.org/whl/cu118
-    "$PY1" -m pip install --no-deps --only-binary=:all: mmcv-full==1.7.2 \
-        -f https://download.openmmlab.com/mmcv/dist/cu118/torch2.0.0/index.html
-    "$UV" pip install --python "$PY1" numpy==1.24.4 scipy==1.10.1 matplotlib==3.7.5 opencv-python-headless==4.8.1.78 \
+    "$UV" pip install --python "$PY1" setuptools==68.2.2 wheel==0.41.3 cython==0.29.35 yapf==0.40.1 numpy==1.24.4
+    if ! "$PY1" -c "import torch; assert torch.__version__=='2.0.0+cu118'" 2>/dev/null; then
+        "$UV" pip install --python "$PY1" torch==2.0.0+cu118 torchvision==0.15.1+cu118 --index-url https://download.pytorch.org/whl/cu118
+    fi
+    if ! "$PY1" -c "import mmcv; from mmcv.ops import nms, roi_align; assert mmcv.__version__=='1.7.2'" 2>/dev/null; then
+        "$PY1" -m pip install --no-deps --only-binary=:all: mmcv-full==1.7.2 \
+            -f https://download.openmmlab.com/mmcv/dist/cu118/torch2.0.0/index.html
+    fi
+    "$UV" pip install --no-build-isolation --python "$PY1" numpy==1.24.4 scipy==1.10.1 matplotlib==3.7.5 opencv-python-headless==4.8.1.78 \
         pillow==10.2.0 pycocotools==2.0.7 shapely==2.0.3 six==1.16.0 terminaltables==3.1.10 \
         timm==0.4.12 tqdm==4.66.2 visdom==0.2.4 addict==2.4.0
 fi
@@ -742,7 +746,8 @@ PY2="$MODERN_ENV/bin/python"
 
 if ! "$PY2" -c "import torch, timm, einops, filterpy, huggingface_hub, safetensors" 2>/dev/null; then
     echo "[Tier-2: env_modern_pyt2] 正在安装现代对比算法依赖..."
-    "$UV" pip install --python "$PY2" timm einops filterpy huggingface_hub safetensors hydra-core iopath lmdb pandas pyyaml tqdm
+    "$UV" pip install --python "$PY2" setuptools==68.2.2 wheel==0.41.3
+    "$UV" pip install --no-build-isolation --python "$PY2" timm einops filterpy huggingface_hub safetensors hydra-core iopath lmdb pandas pyyaml tqdm
 fi
 
 # 6. 保存锁定依赖清单到 Drive
