@@ -78,11 +78,17 @@ def collect_snapshot() -> Dict[str, Any]:
     res_dir = DRIVE_ROOT / "colab/bridge/cmd_results"
     if res_dir.exists():
         try:
-            logs = sorted(res_dir.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+            logs = sorted(
+                [p for p in res_dir.glob("*.log") if not p.name.startswith("w1_stage_")],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if not logs:
+                logs = sorted(res_dir.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
             if logs:
                 latest_log_name = logs[0].name
                 lines = logs[0].read_text(encoding="utf-8", errors="replace").splitlines()
-                latest_log_tail = "\n".join(lines[-25:])[-2500:]
+                latest_log_tail = "\n".join(lines[-20:])[-1100:]
         except Exception:
             pass
 

@@ -706,9 +706,9 @@ fi
 PY1="$SIAMDT_ENV/bin/python"
 
 # 幂等检查：若已通过全套导入门禁则直接跳过安装
-if ! "$PY1" -c "import torch, torchvision, mmcv, timm, shapely, visdom; from mmcv.ops import nms, roi_align; assert torch.__version__=='2.0.0+cu118' and mmcv.__version__=='1.7.2'" 2>/dev/null; then
+if ! "$PY1" -c "import yaml, packaging, torch, torchvision, mmcv, timm, shapely, visdom; from mmcv import Config; from mmcv.ops import nms, roi_align; assert torch.__version__=='2.0.0+cu118' and mmcv.__version__=='1.7.2'" 2>/dev/null; then
     echo "[Tier-1: env_siamdt_cu118] 正在构建恢复 SiamDT 专用环境..."
-    "$UV" pip install --python "$PY1" setuptools==68.2.2 wheel==0.41.3 cython==0.29.35 yapf==0.40.1 numpy==1.24.4
+    "$UV" pip install --python "$PY1" setuptools==68.2.2 wheel==0.41.3 cython==0.29.35 yapf==0.40.1 numpy==1.24.4 PyYAML==6.0.1 packaging==23.2 requests==2.32.3 regex
     if ! "$PY1" -c "import torch; assert torch.__version__=='2.0.0+cu118'" 2>/dev/null; then
         "$UV" pip install --python "$PY1" torch==2.0.0+cu118 torchvision==0.15.1+cu118 --index-url https://download.pytorch.org/whl/cu118
     fi
@@ -718,7 +718,7 @@ if ! "$PY1" -c "import torch, torchvision, mmcv, timm, shapely, visdom; from mmc
     fi
     "$UV" pip install --no-build-isolation --python "$PY1" numpy==1.24.4 scipy==1.10.1 matplotlib==3.7.5 opencv-python-headless==4.8.1.78 \
         pillow==10.2.0 pycocotools==2.0.7 shapely==2.0.3 six==1.16.0 terminaltables==3.1.10 \
-        timm==0.4.12 tqdm==4.66.2 visdom==0.2.4 addict==2.4.0
+        timm==0.4.12 tqdm==4.66.2 visdom==0.2.4 addict==2.4.0 PyYAML==6.0.1 packaging==23.2 requests==2.32.3
 fi
 
 # 3. 为 PyTorch 2.0 注入 torch._six 兼容垫片（供旧版 Apex O1 混合精度无缝调用）
@@ -737,6 +737,9 @@ if [ -d "/content/runtime/Anti-UAV410/trackers/SiamDT/libs/swintransformer" ]; t
     cd /content/runtime/Anti-UAV410/trackers/SiamDT/libs/swintransformer
     "$PY1" setup.py develop --no-deps >/dev/null
 fi
+
+# 强制导入门禁自检（不通过则立即报错退出）
+"$PY1" -c "import yaml, packaging, torch, torchvision, mmcv, timm, shapely, visdom, cv2, pycocotools; from mmcv import Config; from mmcv.ops import nms, roi_align; assert torch.__version__=='2.0.0+cu118' and mmcv.__version__=='1.7.2'; print('[Tier-1 Gate PASS] torch=' + torch.__version__ + ' mmcv=' + mmcv.__version__)"
 
 # 5. 创建并恢复 Tier-2 环境 (env_modern_pyt2: 复用 Colab 原生 PyTorch 2.x + 现代对比算法依赖)
 if [ ! -x "$MODERN_ENV/bin/python" ]; then

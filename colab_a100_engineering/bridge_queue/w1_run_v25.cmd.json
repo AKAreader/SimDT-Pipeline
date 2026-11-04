@@ -1,0 +1,8 @@
+{
+  "cmd_id": "w1_run_v25",
+  "action": "run_wave1",
+  "args": [],
+  "params": {},
+  "timeout_sec": 21600,
+  "note": "Install PyYAML+packaging in Tier-1 env, verify mmcv.Config gate, and run Wave 1 Steps 3-5"
+}

@@ -79,9 +79,62 @@ def read_json_safe(p: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
+def fetch_ntfy_latest(topic: str = "simdt_a100_telem_9fe17727e2a3") -> Optional[Dict[str, Any]]:
+    import urllib.request
+    try:
+        url = f"https://ntfy.sh/{topic}/json?poll=1&since=5m"
+        with urllib.request.urlopen(url, timeout=3.5) as resp:
+            lines = [ln for ln in resp.read().decode("utf-8", errors="replace").splitlines() if ln.strip()]
+        if not lines:
+            return None
+        last_evt = json.loads(lines[-1])
+        msg_str = last_evt.get("message") or ""
+        if "attachment" in last_evt and isinstance(last_evt["attachment"], dict) and last_evt["attachment"].get("url"):
+            with urllib.request.urlopen(last_evt["attachment"]["url"], timeout=3.5) as ar:
+                msg_str = ar.read().decode("utf-8", errors="replace")
+        if not msg_str:
+            return None
+        return json.loads(msg_str)
+    except Exception:
+        return None
+
+
 def render_dashboard(bridge_dir: Path) -> Dict[str, Any]:
     hb = read_json_safe(bridge_dir / "heartbeat.json") or {}
     wp = hb.get("wave_progress") or read_json_safe(bridge_dir / "wave_progress.json") or {}
+    ntfy_snap = fetch_ntfy_latest()
+    ntfy_log_tail = ""
+    if isinstance(ntfy_snap, dict):
+        ntfy_ts = float(ntfy_snap.get("timestamp_epoch") or 0.0)
+        hb_ts = float(hb.get("timestamp_epoch") or 0.0)
+        if ntfy_ts >= hb_ts:
+            hb.update({
+                "status": ntfy_snap.get("status", "ONLINE"),
+                "bridge_version": "2.1.0-ntfy",
+                "hostname": ntfy_snap.get("hostname", hb.get("hostname", "-")),
+                "pid": ntfy_snap.get("pid", hb.get("pid", "-")),
+                "timestamp_epoch": ntfy_ts,
+                "timestamp_utc": ntfy_snap.get("timestamp_utc", ""),
+                "gpu": ntfy_snap.get("gpu") or hb.get("gpu") or {},
+                "gpu_name": ntfy_snap.get("gpu_name") or hb.get("gpu_name") or "NVIDIA A100-SXM4-80GB",
+                "vram_total_mb": ntfy_snap.get("vram_total_mb") or hb.get("vram_total_mb") or 81920.0,
+                "vram_used_mb": ntfy_snap.get("vram_used_mb") or 0.0,
+                "vram_free_mb": ntfy_snap.get("vram_free_mb") or 81153.0,
+            })
+            if isinstance(ntfy_snap.get("wave_progress"), dict):
+                wp = ntfy_snap["wave_progress"]
+                hb["wave_progress"] = wp
+            ntfy_log_tail = str(ntfy_snap.get("latest_log_tail") or "")
+            # 同步回本地缓存文件，让已打开的桌面 GUI 窗口无需重启即可实时显示最新状态
+            try:
+                (bridge_dir / "heartbeat.json").write_text(json.dumps(hb, indent=2, ensure_ascii=False), encoding="utf-8")
+                if wp:
+                    (bridge_dir / "wave_progress.json").write_text(json.dumps(wp, indent=2, ensure_ascii=False), encoding="utf-8")
+                log_name = str(ntfy_snap.get("latest_log_name") or "")
+                if log_name and ntfy_log_tail:
+                    (bridge_dir / "cmd_results" / log_name).write_text(ntfy_log_tail + "\n", encoding="utf-8")
+            except Exception:
+                pass
 
     now = time.time()
     hb_epoch = float(hb.get("timestamp_epoch") or 0.0)
@@ -161,9 +214,9 @@ def render_dashboard(bridge_dir: Path) -> Dict[str, Any]:
         md += "| - | 正在执行或等待触发第 1 步 | ⏳ 运行中 | - | - |\n"
 
     # 读取最新运行日志尾部
-    log_tail = ""
+    log_tail = ntfy_log_tail
     res_dir = bridge_dir / "cmd_results"
-    if res_dir.exists():
+    if not log_tail and res_dir.exists():
         logs = sorted(res_dir.glob("*.log"), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
         if logs:
             try:

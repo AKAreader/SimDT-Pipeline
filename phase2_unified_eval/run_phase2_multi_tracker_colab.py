@@ -2440,7 +2440,8 @@ def execute_multi_tracker_eval(
         # 实时扫描正在运行的慢算法的 `telemetry_eval_dir/*.jsonl`；若某个慢算法仍有 > 4 条未完成序列，
         # 立即在空闲槽位上为该慢算法派生补充的方案 A 分片 Worker！
         if freed_slots and concurrency_mode == "hybrid_b_then_a" and active_procs:
-            running_tks = sorted({str(m["tracker_name"]) for _, m in active_procs})
+            failed_tks = {str(w["tracker_name"]) for w in completed_worker_logs if w.get("returncode") not in (0, None)}
+            running_tks = sorted({str(m["tracker_name"]) for _, m in active_procs if str(m["tracker_name"]) not in failed_tks})
             for s_slot in list(freed_slots):
                 # 实时统计各活跃算法的剩余未完成序列数与未锁定序列数
                 candidates: List[Tuple[int, int, str]] = []
@@ -2627,11 +2628,15 @@ def main() -> None:
     if args.action == "status":
         rep = inspect_phase2_status(drive_root, split_json_path, selected_trackers, args.runtime_root, args.dataset_root)
         print(json.dumps(rep, indent=2, ensure_ascii=False))
+        if rep.get("nonzero_exit_workers"):
+            raise SystemExit(1)
         return
 
     if args.action == "stage-repos-and-weights":
         rep = stage_repos_and_weights(drive_root, args.runtime_root, selected_trackers)
         print(json.dumps(rep, indent=2, ensure_ascii=False))
+        if rep.get("nonzero_exit_workers"):
+            raise SystemExit(1)
         return
 
     if args.action == "ingest-txt":
@@ -2646,6 +2651,8 @@ def main() -> None:
             drive_root=drive_root,
         )
         print(json.dumps(rep, indent=2, ensure_ascii=False))
+        if rep.get("nonzero_exit_workers"):
+            raise SystemExit(1)
 
     elif args.action == "eval":
         rep = execute_multi_tracker_eval(
@@ -2663,6 +2670,8 @@ def main() -> None:
             uetrack_dataset_name=args.uetrack_dataset_name,
         )
         print(json.dumps(rep, indent=2, ensure_ascii=False))
+        if rep.get("nonzero_exit_workers"):
+            raise SystemExit(1)
 
     if args.action == "extract-episodes" or args.run_extractor:
         telemetry_root = drive_root / "experiments/failure_diagnosis/per_frame_telemetry"
