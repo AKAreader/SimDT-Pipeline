@@ -28,6 +28,7 @@ DRIVE_ROOT = Path(os.environ.get("SIAMDT_DRIVE_ROOT", "/content/drive/MyDrive/Si
 PIPELINE_DIR = Path(__file__).resolve().parents[1]
 PROGRESS_FILE = RUNTIME_ROOT / "wave_progress.json"
 DRIVE_PROGRESS_FILE = DRIVE_ROOT / "colab/bridge/wave_progress.json"
+os.environ["MPLBACKEND"] = "Agg"
 
 try:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -92,6 +93,7 @@ def count_all_trackers_completed_sequences() -> Tuple[int, Dict[str, int]]:
 
 BUILD_WAVE2_ENVS_BASH = r'''set -euo pipefail
 
+export MPLBACKEND="Agg"
 export PIP_CACHE_DIR="/content/cache/pip"
 export UV_CACHE_DIR="/content/cache/uv"
 export UV_LINK_MODE="copy"
@@ -155,15 +157,15 @@ if [ ! -x "$ENV_C/bin/python" ]; then
     "$UV" venv --system-site-packages --seed "$ENV_C"
 fi
 PY_C="$ENV_C/bin/python"
-if ! "$PY_C" -c "import torch, hydra, omegaconf, iopath, loguru, shapely, vot.region, cv2, lmdb, jpeg4py" 2>/dev/null; then
+if ! "$PY_C" -c "import torch, torchvision, hydra, omegaconf, iopath, loguru, shapely, vot.region, cv2, lmdb, jpeg4py" 2>/dev/null; then
     echo "[Wave2-Env C] 正在构建 DAM4SAM / SAMOSA / SAMURAI (SAM 2.1) 环境..."
     "$UV" pip install --python "$PY_C" setuptools==68.2.2 wheel==0.41.3
     "$UV" pip install --no-build-isolation --python "$PY_C" \
-        hydra-core==1.3.2 omegaconf==2.3.0 iopath loguru shapely \
+        torch torchvision hydra-core==1.3.2 omegaconf==2.3.0 iopath loguru shapely \
         vot-toolkit==0.7.1 vot-trax==4.0.2 lmdb jpeg4py decord tensordict submitit \
         opencv-python-headless pillow tqdm scipy pandas matplotlib pycocotools scikit-image tikzplotlib wandb
 fi
-"$PY_C" -c "import torch, hydra, omegaconf, iopath, loguru, shapely, vot.region; print('[C PASS] torch=' + torch.__version__)"
+"$PY_C" -c "import torch, torchvision, hydra, omegaconf, iopath, loguru, shapely, vot.region; print('[C PASS] torch=' + torch.__version__ + ' tv=' + torchvision.__version__)"
 
 # 4. D 环境: /content/envs/trackit-memlo-pt2 (MemLoTrack)
 ENV_D="/content/envs/trackit-memlo-pt2"
@@ -171,14 +173,14 @@ if [ ! -x "$ENV_D/bin/python" ]; then
     "$UV" venv --system-site-packages --seed "$ENV_D"
 fi
 PY_D="$ENV_D/bin/python"
-if ! "$PY_D" -c "import torch, timm, safetensors, fvcore, tabulate, exifread, zmq, psutil, turbojpeg, shapely" 2>/dev/null; then
+if ! "$PY_D" -c "import torch, torchvision, timm, safetensors, fvcore, tabulate, exifread, zmq, psutil, turbojpeg, shapely" 2>/dev/null; then
     echo "[Wave2-Env D] 正在构建 MemLoTrack (DINOv2+LoRA) 环境..."
     "$UV" pip install --python "$PY_D" setuptools==68.2.2 wheel==0.41.3
     "$UV" pip install --no-build-isolation --python "$PY_D" \
-        timm safetensors fvcore tabulate exifread pyzmq psutil PyTurboJPEG shapely \
+        torch torchvision timm safetensors fvcore tabulate exifread pyzmq psutil PyTurboJPEG shapely \
         wandb pyyaml matplotlib tqdm pillow opencv-python-headless scipy pandas einops pycocotools zstandard
 fi
-"$PY_D" -c "import torch, timm, safetensors, fvcore, tabulate, exifread, zmq, psutil, turbojpeg; print('[D PASS] timm=' + timm.__version__)"
+"$PY_D" -c "import torch, torchvision, timm, safetensors, fvcore, tabulate, exifread, zmq, psutil, turbojpeg; print('[D PASS] timm=' + timm.__version__ + ' tv=' + torchvision.__version__)"
 
 echo "[完成] Wave 2 全部 4 组对比算法环境 (B1/B2/C/D) 已就绪！"
 '''

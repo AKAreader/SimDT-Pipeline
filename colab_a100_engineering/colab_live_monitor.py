@@ -288,8 +288,8 @@ def main() -> None:
             f"预计完成={s['eta_finish_beijing']} | {s['current_step']}"
         )
         print(line, flush=True)
-        if s["wave_status"] == "COMPLETED_SUCCESS":
-            print("🎉 [LiveMonitor] 检测到 Wave 1 已全部完成！", flush=True)
+        if s["wave_status"] == "COMPLETED_SUCCESS" and int(s.get("total_seqs", 24)) >= 240:
+            print("🎉 [LiveMonitor] 检测到 Wave 2 已全部完成！", flush=True)
             break
         time.sleep(max(2.0, args.interval))
 

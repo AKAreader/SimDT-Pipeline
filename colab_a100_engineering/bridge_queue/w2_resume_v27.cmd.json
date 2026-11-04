@@ -1,0 +1,8 @@
+{
+  "cmd_id": "w2_resume_v27",
+  "action": "run_wave1",
+  "args": ["--wave", "2"],
+  "params": {},
+  "timeout_sec": 43200,
+  "note": "Resume Wave 2 with MPLBACKEND=Agg and explicit torchvision in C/D envs"
+}

@@ -1417,6 +1417,7 @@ REPO_CKPT_REL = os.environ.get("_P2_REPO_CKPT_REL", "")
 SPLIT_JSON = Path(os.environ["_P2_SPLIT_JSON"])
 DATASET_DIR = Path(os.environ["_P2_DATASET_DIR"])
 GIT_SHA = os.environ.get("_P2_GIT_SHA", "phase2")
+os.environ["MPLBACKEND"] = "Agg"
 EVAL_TAG = os.environ.get("_P2_EVAL_TAG", GIT_SHA)
 MAX_SEQS = int(os.environ.get("_P2_MAX_SEQS", "0"))
 LOCK_DIR = Path(os.environ["_P2_LOCK_DIR"])
