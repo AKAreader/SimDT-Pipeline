@@ -1,0 +1,8 @@
+{
+  "cmd_id": "w1_telemetry_v23",
+  "action": "run_wave1",
+  "args": [],
+  "params": {},
+  "timeout_sec": 21600,
+  "note": "Start ntfy real-time telemetry daemon and ensure Wave 1 completion"
+}

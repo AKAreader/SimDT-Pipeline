@@ -1587,6 +1587,17 @@ def check_cells_plain_python() -> dict:
 
 def run_cells(keys: str) -> None:
     """按顺序在独立命名空间中执行指定单元（供远程接管桥 setup_env / stage_assets 动作调用）。"""
+    try:
+        import sys as _sys
+        from pathlib import Path as _Path
+        _eng = _Path(__file__).resolve().parent
+        if str(_eng) not in _sys.path:
+            _sys.path.insert(0, str(_eng))
+        import colab_ntfy_telemetry as _ntfy_telem
+        _ntfy_telem.ensure_daemon_started()
+        _ntfy_telem.push_once(_ntfy_telem.collect_snapshot())
+    except Exception:
+        pass
     for key in [k.strip() for k in keys.split(",") if k.strip()]:
         if key not in CELLS_BY_KEY:
             raise SystemExit(f"未知单元: {key}；可选 {list(CELLS_BY_KEY)}")

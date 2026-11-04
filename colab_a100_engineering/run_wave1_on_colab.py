@@ -26,6 +26,12 @@ PIPELINE_DIR = Path(__file__).resolve().parents[1]
 PROGRESS_FILE = RUNTIME_ROOT / "wave_progress.json"
 DRIVE_PROGRESS_FILE = DRIVE_ROOT / "colab/bridge/wave_progress.json"
 
+try:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import colab_ntfy_telemetry as _ntfy_telem
+except Exception:
+    _ntfy_telem = None
+
 
 def beijing_time_str(epoch: float | None = None) -> str:
     ts = epoch if epoch is not None else time.time()
@@ -42,6 +48,11 @@ def write_wave_progress(payload: Dict[str, Any]) -> None:
             tmp = target.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
             os.replace(str(tmp), str(target))
+        except Exception:
+            pass
+    if _ntfy_telem is not None:
+        try:
+            _ntfy_telem.ensure_daemon_started()
         except Exception:
             pass
 

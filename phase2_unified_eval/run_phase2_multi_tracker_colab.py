@@ -72,6 +72,16 @@ from failure_episode_extractor import (  # noqa: E402
     run_phase2_extraction_pipeline,
 )
 
+try:
+    _colab_eng_dir = Path(__file__).resolve().parents[1] / "colab_a100_engineering"
+    if _colab_eng_dir.exists() and str(_colab_eng_dir) not in sys.path:
+        sys.path.insert(0, str(_colab_eng_dir))
+    import colab_ntfy_telemetry as _ntfy_telem
+    _ntfy_telem.ensure_daemon_started()
+    _ntfy_telem.push_once(_ntfy_telem.collect_snapshot())
+except Exception:
+    pass
+
 
 # ==============================================================================
 # 并发调度常量
