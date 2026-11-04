@@ -529,7 +529,6 @@ def stage_repos_and_weights(
                         output=str(weight_drive),
                         quiet=False,
                         use_cookies=False,
-                        remaining_ok=True,
                     )
                     downloaded = [p.name for p in weight_drive.rglob("*") if p.is_file()]
                     tk_res["weight_status"].append(f"GDRIVE_FOLDER_PULLED: {downloaded}")
